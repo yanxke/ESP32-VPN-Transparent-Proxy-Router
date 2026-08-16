@@ -43,14 +43,14 @@ The packet path is written in C rather than C++. ESP-IDF and the custom lwIP hoo
 - Yellow RGB boot indication: two pulses over one second, then steady green = transparent VLESS router with an upstream IP, yellow = transparent mode while the upstream is unavailable, or blue = setup/portal mode. A short BOOT click toggles modes for this boot.
 - Hold BOOT for five seconds to erase configuration and reboot; the RGB LED turns red during the final second
 - Internal SOCKS5 listener on `192.168.4.1:1080`, supporting TCP CONNECT to domain names
-- VLESS TCP transport verified in hardware through the companion ESP32-C3 tester: `C3 -> SOCKS5 -> VLESS -> google.com:80` returned HTTP `301`.
+- VLESS TCP transport verified in hardware.
 - Custom lwIP IPv4 TCP interception and reply-tuple rewriting for AP clients
 - Direct VLESS XUDP framing is implemented and the configured server passed `GET /api/test-xudp` with an upstream DNS query.
 - Persistent transparent IPv4 UDP relay verified in hardware: non-local datagrams are intercepted, sent as direct VLESS XUDP, and replies have their original tuple restored. Subsequent datagrams use XUDP Keep frames on the existing VLESS stream. DHCP and the router's local DNS remain local.
 - Lock-protected transparent-flow table with immediate completion cleanup and a 30-second idle-flow maintenance sweep
-- Transparent port-80 HTTP tested in hardware: an ordinary C3 TCP connection to a Google IP, with no SOCKS/proxy handshake, was relayed as `google.com` through VLESS and returned HTTP `301`.
+- Transparent port-80 HTTP tested in hardware: an ordinary TCP connection to a Google IP, with no SOCKS/proxy handshake, was relayed as `google.com` through VLESS and returned HTTP `301`.
 - VLESS-aware DNS-over-TCP forwarding with a 64-entry A-record cache, so browser-originated captured connections can use the requested domain rather than exposing a direct DNS query.
-- TLS ClientHello SNI extraction for transparent TCP domain requests, verified in hardware with a Google HTTPS request through the companion C3 tester.
+- TLS ClientHello SNI extraction for transparent TCP domain requests, verified in hardware with a Google HTTPS request.
 
 ## Compatibility matrix
 
@@ -117,10 +117,6 @@ The built-in single-pixel WS2812 RGB LED is driven on GPIO48 by default. If a bo
 
 For a strict no-direct-DNS deployment, configure the resolver as a numeric address such as `1.1.1.1`. A resolver hostname such as `one.one.one.one` works and its DNS queries are sent over VLESS after connection, but the ESP-IDF network stack may use the upstream network once to resolve that hostname before opening the VLESS stream.
 
-## Companion tester
-
-The ESP32-C3 tester is in `../VLESS-Tester`. Update `include/tester_config.h` after changing router AP credentials. Its serial output is the end-to-end VLESS transport test.
-
 ## Current transparent-routing limits
 
 - TCP interception is IPv4-only and has a 60-flow table with a two-minute idle expiry. The lwIP socket pool is configured for 120 sockets and 128 active TCP PCBs; a transparent stream consumes a client-side and VLESS-side TCP PCB. ESP-IDF reserves six VFS descriptors, so 120 is the safe maximum under its 128-descriptor select limit. Relay-task stacks are allocated from PSRAM, leaving internal RAM for Wi-Fi/lwIP. TCP receive and accept queues are 32 entries, Wi-Fi has 64 dynamic RX buffers, and the DHCP server supports 16 stations.
@@ -140,15 +136,15 @@ This repository is public and buildable, but it is not yet appropriate for an un
 
 - [x] VLESS-aware DNS forwarding/cache for IPv4 A records, with fail-closed captive-DNS fallback.
 - [x] DNS cache for transparent flows; ClientHello SNI parsing supplies a fallback domain source for TLS.
-- [x] End-to-end DNS, HTTP, and HTTPS/SNI regression test through the ESP32-C3 tester.
+- [x] End-to-end DNS, HTTP, and HTTPS/SNI regression test.
 - [x] Connection-table locking, flow limits, and fail-closed kill switch for IPv4 TCP. IPv6 is disabled until tunnel support exists.
 - [x] Direct VLESS XUDP compatibility probe against the configured sing-box endpoint, plus bounded transparent UDP DNS-style request/response relay. It does not forward UDP directly to the Wi-Fi upstream.
 - [x] Persistent XUDP association management, bounded XUDP frame demultiplexing/reassembly, and ingress back-pressure. Client-originated IPv4 fragments remain fail-closed.
 - [x] sing-box smux transport for persistent UDP associations and captured transparent TCP streams, including sing-mux session negotiation, smux stream IDs, single-owner frame serialization, bounded TCP downstream queues, frame demultiplexing, and reconnect notification. The portal stores an explicit enable/disable switch; it defaults off for compatibility.
-- [ ] Validate the shared TCP smux path under an ESP-IDF C3/host 40-stream burst and long-running mixed TCP/UDP traffic; direct VLESS remains the recovery path when multiplexing is disabled.
+- [ ] Validate the shared TCP smux path under a host 40-stream burst and long-running mixed TCP/UDP traffic; direct VLESS remains the recovery path when multiplexing is disabled.
 - [x] IPv6 fail-closed policy: disabled until tunnel support exists.
 - [ ] Encrypted NVS for deployment.
-- [x] ESP-IDF C3 32-stream transparent HTTP burst: 32 connections opened; 30 HTTP responses completed through shared smux after the 64 KiB shared receive-buffer change.
+- [x] ESP-IDF 32-stream transparent HTTP burst: 32 connections opened; 30 HTTP responses completed through shared smux after the 64 KiB shared receive-buffer change.
 - [ ] Make the 32-stream shared-smux burst consistently pass, then run a 60-flow host stress test plus throughput, reconnect, and multi-client soak tests.
 - [ ] Add encrypted NVS, signed release artifacts, and a documented recovery/upgrade procedure.
 
