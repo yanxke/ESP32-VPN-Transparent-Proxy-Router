@@ -1,0 +1,2 @@
+# ESP-IDF headers use implementation-specific attributes and inline assembly.
+missingIncludeSystem

@@ -1,0 +1,30 @@
+name: Firmware quality
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install formatter
+        run: sudo apt-get update && sudo apt-get install -y clang-format clang-tidy
+      - name: Install PlatformIO
+        run: python3 -m pip install --upgrade platformio
+      - name: Verify C formatting
+        run: |
+          clang-format --dry-run --Werror --style=file \
+            src/main.c src/transparent_tcp.c src/xudp_codec.c src/singmux_codec.c \
+            src/transparent_tcp.h src/xudp_codec.h src/singmux_codec.h include/lwip_router_hook.h
+      - name: Build firmware
+        run: pio run -e esp32s3_r8n16
+      - name: Verify control-flow braces
+        shell: pwsh
+        run: |
+          $sources = @('src/main.c', 'src/transparent_tcp.c', 'src/xudp_codec.c', 'src/singmux_codec.c')
+          $output = clang-tidy -p .pio/build/esp32s3_r8n16 --config-file=.clang-tidy $sources 2>&1 | Out-String
+          if ($output -match 'readability-braces-around-statements') { throw $output }
+      - name: Run static analysis
+        run: pio check -e esp32s3_r8n16 --fail-on-defect medium

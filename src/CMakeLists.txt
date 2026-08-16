@@ -1,0 +1,2 @@
+idf_component_register(SRCS "main.c" "transparent_tcp.c" "xudp_codec.c" "singmux_codec.c"
+                       REQUIRES esp_wifi esp_netif esp_event nvs_flash esp_http_server lwip esp_driver_rmt app_update)
