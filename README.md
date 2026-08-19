@@ -109,8 +109,8 @@ passwords or the VLESS UUID.
 For throughput diagnosis, start a speed test and enter `diag` twice about one
 second apart. It reports the payload upload/download rate, STA RSSI and channel,
 AP client count, TCP window/buffer configuration, UDP/smux queue pressure,
-dropped datagrams, and free internal/PSRAM. The firmware uses 32 KiB TCP
-receive/send buffers, SACK, 32 Wi-Fi TX buffers, and disables STA modem sleep;
+dropped datagrams, and free internal/PSRAM. The firmware uses a 128 KiB scaled TCP
+receive window, a 64 KiB send buffer, SACK, 32 Wi-Fi TX buffers, and disables STA modem sleep;
 the previous 5,760-byte TCP windows could limit a VLESS TCP stream to roughly
 1 Mbps at high RTT. Use `route direct` for a same-boot,
 non-VLESS comparison against a China speed-test server, then `route vless` to

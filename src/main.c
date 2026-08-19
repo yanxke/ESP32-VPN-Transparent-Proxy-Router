@@ -259,10 +259,12 @@ static void serial_diagnostics(void)
 
     ESP_LOGI(TAG,
              "DIAG route=%s upstream=%s Wi-Fi channel=%u secondary=%d AP-clients=%u; "
-             "TCP wnd=32768 snd=32768 recvmbox=32; payload up=%u B/s down=%u B/s "
+             "TCP wnd=%u snd=%u recvmbox=%u; payload up=%u B/s down=%u B/s "
              "(%.2f/%.2f Mbps)",
              transparent_mode_name(), s_has_upstream ? "up" : "down", primary, (int)secondary,
-             client_result == ESP_OK ? clients.num : 0, bandwidth.upload_bps,
+             client_result == ESP_OK ? clients.num : 0, (unsigned)CONFIG_LWIP_TCP_WND_DEFAULT,
+             (unsigned)CONFIG_LWIP_TCP_SND_BUF_DEFAULT, (unsigned)CONFIG_LWIP_TCP_RECVMBOX_SIZE,
+             bandwidth.upload_bps,
              bandwidth.download_bps, bandwidth.upload_bps * 8.0 / 1000000.0,
              bandwidth.download_bps * 8.0 / 1000000.0);
     if (upstream_result == ESP_OK)
