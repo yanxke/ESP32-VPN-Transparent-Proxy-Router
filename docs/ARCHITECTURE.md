@@ -4,11 +4,11 @@
 
 ```text
 Wi-Fi client
-  -> SoftAP / DHCP (192.168.4.1)
+  -> SoftAP / DHCP (configurable 192.168.X.1/24, default 192.168.4.1)
   -> custom lwIP IPv4 interception
   -> transparent TCP relay or UDP association manager
-  -> VLESS TCP transport
-  -> configured VLESS server
+  -> VLESS TCP transport or direct upstream Wi-Fi forwarding
+  -> configured VLESS server or upstream network
 ```
 
 The AP and local portal remain local. IPv4 TCP flows are tracked so the reply tuple can be restored for the client. UDP flows are mapped to bounded persistent associations. IPv6 is disabled rather than partly routed.
@@ -25,17 +25,18 @@ Direct mode uses VLESS XUDP with one persistent VLESS stream per active associat
 
 ## Configuration
 
-The portal is served at `http://192.168.4.1` and every portal or diagnostic
-route requires HTTP Basic authentication. Factory credentials are `admin` /
-`changeme`; the administrator can change the password on the main portal.
+The portal is served at the configured AP gateway address, `http://192.168.4.1`
+by default, and every portal or diagnostic route requires HTTP Basic
+authentication. Factory credentials are `admin` / `changeme`; the administrator
+can change the password on the main portal.
 Configuration is persisted in NVS. Secret fields are write-only in the portal:
 a reload never returns saved passwords or the UUID. The administrator password
 is stored as a SHA-256 hash, but NVS encryption and HTTPS are not implemented.
 
-Short BOOT press switches between transparent-router and setup-portal modes for
-the current boot. Holding BOOT for five seconds erases all saved configuration,
-including the administrator password hash, and restarts the device; it restores
-the factory portal credentials.
+Short BOOT press switches between transparent VLESS routing and transparent
+upstream-only routing for the current boot. Holding BOOT for five seconds
+erases all saved configuration, including the administrator password hash, and
+restarts the device; it restores the factory portal credentials.
 
 The USB/UART console at 115200 is a physical recovery and administration path.
 It bypasses portal authentication, accepts `help` for command syntax, and can
