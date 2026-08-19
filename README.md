@@ -10,6 +10,8 @@ Read [Architecture](docs/ARCHITECTURE.md), [Security policy](SECURITY.md), and [
 
 Use `esp32s3_r8n16` for 16 MB flash boards and `esp32s3_r8n8` for 8 MB flash boards. Both targets assume 8 MB PSRAM.
 
+ESP-IDF configuration is layered: `sdkconfig.defaults` holds the shared router and performance settings, while `sdkconfig.defaults.r8n8` and `sdkconfig.defaults.r8n16` contain only the flash size and matching partition-table selection. PlatformIO writes the generated full configuration to ignored `sdkconfig.build.*` files, so it does not drift into source control.
+
 Example boards:
 
 - [Waveshare ESP32-S3 Mini Development Board](https://www.waveshare.com/esp32-s3-zero.htm?sku=33879) for the `esp32s3_r8n8` target
@@ -33,16 +35,17 @@ The packet path is written in C rather than C++. ESP-IDF and the custom lwIP hoo
 
 ## Current specifications
 
-- AP with DHCP at `192.168.4.1` (factory name: `ESP32-VLESS-Setup`)
-- Captive-DNS setup portal at `http://192.168.4.1`
+- AP with DHCP at configurable `/24` gateway `192.168.X.1` (factory default `192.168.4.1`, factory name `ESP32-VLESS-Setup`)
+- Captive-DNS setup portal at the configured AP gateway (factory default `http://192.168.4.1`)
 - Factory DNS resolver: `one.one.one.one` (no first-time DNS entry required)
 - Independent configuration of upstream Wi-Fi and VLESS credentials
 - Pasteable `vless://UUID@HOST:PORT?encryption=none&type=tcp` input
-- Router Wi-Fi (AP) name/password configuration is on the main portal at `http://192.168.4.1`
+- Router Wi-Fi (AP) name/password/gateway configuration is on the main portal at the configured AP gateway
 - Persisted settings in NVS; saved UUID and passwords are never returned to the portal
-- Yellow RGB boot indication: two pulses over one second, then steady green = transparent VLESS router with an upstream IP, yellow = transparent mode while the upstream is unavailable, or blue = setup/portal mode. A short BOOT click toggles modes for this boot.
+- Yellow RGB boot indication: two pulses over one second, then steady green = transparent VLESS router with an upstream IP, yellow = VLESS mode while the upstream is unavailable, cyan = transparent upstream-only router with an upstream IP, or blue = upstream-only mode while the upstream is unavailable. A short BOOT click toggles between transparent VLESS and transparent upstream-only modes for this boot.
+- Hold BOOT for one second to enter configuration mode for the current boot. It disconnects the upstream Wi-Fi, restores the setup AP, and keeps the portal available at the configured gateway; the RGB LED blinks yellow. Saving an upstream profile exits configuration mode and reconnects.
 - Hold BOOT for five seconds to erase configuration and reboot; the RGB LED turns red during the final second
-- Internal SOCKS5 listener on `192.168.4.1:1080`, supporting TCP CONNECT to domain names
+- Internal SOCKS5 listener on the configured AP gateway at port `1080`, supporting TCP CONNECT to domain names
 - VLESS TCP transport verified in hardware.
 - Custom lwIP IPv4 TCP interception and reply-tuple rewriting for AP clients
 - Direct VLESS XUDP framing is implemented and the configured server passed `GET /api/test-xudp` with an upstream DNS query.
@@ -98,12 +101,12 @@ hash in NVS and is not returned by the portal API.
 The USB/UART console at 115200 is a physical-access recovery interface and does
 not require portal authentication. Enter `help` to list its commands. `status`
 reports the saved non-secret configuration and whether smux is enabled. The
-console can configure the upstream Wi-Fi (`wifi`), router AP (`ap`), VLESS
-profile (`vless` or `vless-uri`), DNS resolver (`dns`), multiplexing (`mux`),
-and portal password (`admin`). It never prints saved passwords or the VLESS
-UUID.
+console can configure the upstream Wi-Fi (`wifi`), router AP (`ap`), AP gateway
+IP (`apip`), VLESS profile (`vless` or `vless-uri`), DNS resolver (`dns`),
+multiplexing (`mux`), and portal password (`admin`). It never prints saved
+passwords or the VLESS UUID.
 
-After flashing, join the setup AP and visit `http://192.168.4.1`. Configure the router AP, upstream Wi-Fi, and VLESS profile independently. Do not commit a configured `sdkconfig`, NVS dump, URI, UUID, or Wi-Fi password to a public repository.
+After flashing, join the setup AP and visit the AP gateway at `http://192.168.4.1` by default. Configure the router AP, downstream subnet by setting the ESP32 gateway IP, upstream Wi-Fi, and VLESS profile independently. Do not commit a configured `sdkconfig`, NVS dump, URI, UUID, or Wi-Fi password to a public repository.
 
 For browser-only flashing, every build creates a target-specific image such as `dist/esp32-vless-router-esp32s3_r8n16.bin` or `dist/esp32-vless-router-esp32s3_r8n8.bin`. Follow [Browser-based flashing](docs/WEB_FLASHING.md) to program the image matching your board at address `0x0` using esptool-js. This full image installs the target's OTA partition table and can clear saved configuration; record the router settings first.
 
