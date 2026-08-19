@@ -310,9 +310,9 @@ static void connect_upstream(void)
     wifi_config_t station = {0};
     strlcpy((char *)station.sta.ssid, s_config.upstream_ssid, sizeof(station.sta.ssid));
     strlcpy((char *)station.sta.password, s_config.upstream_password, sizeof(station.sta.password));
-    station.sta.threshold.authmode = s_config.upstream_password[0] ? WIFI_AUTH_WPA2_PSK
-                                                                    : WIFI_AUTH_OPEN;
-    station.sta.pmf_cfg.capable    = true;
+    station.sta.threshold.authmode =
+        s_config.upstream_password[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+    station.sta.pmf_cfg.capable = true;
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &station));
     ESP_ERROR_CHECK(esp_wifi_connect());
     ESP_LOGI(TAG, "Connecting to upstream '%s' with password '%s'%s", s_config.upstream_ssid,
@@ -355,8 +355,9 @@ static void network_event(void *arg, esp_event_base_t base, int32_t event, void 
     if (base == WIFI_EVENT && event == WIFI_EVENT_STA_DISCONNECTED && s_config.upstream_ssid[0])
     {
         const wifi_event_sta_disconnected_t *disconnected = data;
-        ESP_LOGW(TAG, "Upstream '%s' disconnected: %s (reason=%u); retrying", s_config.upstream_ssid,
-                 wifi_disconnect_reason_text(disconnected->reason), (unsigned)disconnected->reason);
+        ESP_LOGW(TAG, "Upstream '%s' disconnected: %s (reason=%u); retrying",
+                 s_config.upstream_ssid, wifi_disconnect_reason_text(disconnected->reason),
+                 (unsigned)disconnected->reason);
         s_has_upstream = false;
         reset_transparent_transport_state();
         refresh_transparent_interception_state();
@@ -371,7 +372,7 @@ static void network_event(void *arg, esp_event_base_t base, int32_t event, void 
     if (base == IP_EVENT && event == IP_EVENT_STA_GOT_IP)
     {
         const ip_event_got_ip_t *got_ip = data;
-        char                      ip[16];
+        char                     ip[16];
         esp_ip4addr_ntoa(&got_ip->ip_info.ip, ip, sizeof(ip));
         if (s_configuration_mode)
         {
@@ -781,7 +782,8 @@ static esp_err_t config_get(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     char chunk[2048];
     snprintf(chunk, sizeof(chunk),
-             "{\"firmware_version\":\"%s\",\"ap_ssid\":\"%s\",\"ap_ip\":\"%s\",\"ssid\":\"%s\",\"open_network\":%s,",
+             "{\"firmware_version\":\"%s\",\"ap_ssid\":\"%s\",\"ap_ip\":\"%s\",\"ssid\":\"%s\","
+             "\"open_network\":%s,",
              BUILD_GIT_VERSION, configured_or_default(s_config.ap_ssid, AP_SSID), ap_ip,
              s_config.upstream_ssid, s_config.upstream_password[0] ? "false" : "true");
     httpd_resp_sendstr_chunk(req, chunk);
@@ -820,26 +822,25 @@ static esp_err_t config_get(httpd_req_t *req)
     {
         httpd_resp_sendstr_chunk(req, "null");
     }
-    snprintf(chunk, sizeof(chunk),
-             ",\"host\":\"%s\",\"port\":%u,\"dns_resolver\":\"%s\",\"singmux_enabled\":%s,"
-             "\"mode\":\"%s\",\"connected\":%s,\"ip\":\"%s\",\"gateway\":\"%s\",\"netmask\":\"%s\","
-             "\"dns\":\"%s\",\"xudp_active\":%u,\"xudp_queued\":%u,\"xudp_dropped\":%u,"
-             "\"xudp_rx_dropped\":%u,\"xudp_tunnel_failures\":%u,\"transparent_tcp_max\":%u,"
-             "\"singmux_connected\":%s,\"singmux_tcp_active\":%u,\"singmux_control_queued\":%u,"
-             "\"up_bps\":%u,\"down_bps\":%u,\"up_bytes\":%llu,\"down_bytes\":%llu}",
-             s_config.vless_host, s_config.vless_port, s_config.dns_resolver,
-             s_config.singmux_enabled ? "true" : "false", transparent_mode_name(),
-             s_has_upstream ? "true" : "false", ip, gateway, netmask, dns_server,
-             (unsigned)s_udp_active_associations,
-             s_udp_manager_queue ? (unsigned)uxQueueMessagesWaiting(s_udp_manager_queue) : 0,
-             (unsigned)s_udp_queue_drops, (unsigned)s_udp_rx_drops,
-             (unsigned)s_udp_tunnel_failures, (unsigned)TRANSPARENT_TCP_MAX_FLOWS,
-             s_singmux_tunnel >= 0 ? "true" : "false", (unsigned)singmux_tcp_active,
-             s_singmux_control_queue ? (unsigned)uxQueueMessagesWaiting(s_singmux_control_queue)
-                                     : 0,
-             (unsigned)bandwidth.upload_bps, (unsigned)bandwidth.download_bps,
-             (unsigned long long)bandwidth.upload_bytes,
-             (unsigned long long)bandwidth.download_bytes);
+    snprintf(
+        chunk, sizeof(chunk),
+        ",\"host\":\"%s\",\"port\":%u,\"dns_resolver\":\"%s\",\"singmux_enabled\":%s,"
+        "\"mode\":\"%s\",\"connected\":%s,\"ip\":\"%s\",\"gateway\":\"%s\",\"netmask\":\"%s\","
+        "\"dns\":\"%s\",\"xudp_active\":%u,\"xudp_queued\":%u,\"xudp_dropped\":%u,"
+        "\"xudp_rx_dropped\":%u,\"xudp_tunnel_failures\":%u,\"transparent_tcp_max\":%u,"
+        "\"singmux_connected\":%s,\"singmux_tcp_active\":%u,\"singmux_control_queued\":%u,"
+        "\"up_bps\":%u,\"down_bps\":%u,\"up_bytes\":%llu,\"down_bytes\":%llu}",
+        s_config.vless_host, s_config.vless_port, s_config.dns_resolver,
+        s_config.singmux_enabled ? "true" : "false", transparent_mode_name(),
+        s_has_upstream ? "true" : "false", ip, gateway, netmask, dns_server,
+        (unsigned)s_udp_active_associations,
+        s_udp_manager_queue ? (unsigned)uxQueueMessagesWaiting(s_udp_manager_queue) : 0,
+        (unsigned)s_udp_queue_drops, (unsigned)s_udp_rx_drops, (unsigned)s_udp_tunnel_failures,
+        (unsigned)TRANSPARENT_TCP_MAX_FLOWS, s_singmux_tunnel >= 0 ? "true" : "false",
+        (unsigned)singmux_tcp_active,
+        s_singmux_control_queue ? (unsigned)uxQueueMessagesWaiting(s_singmux_control_queue) : 0,
+        (unsigned)bandwidth.upload_bps, (unsigned)bandwidth.download_bps,
+        (unsigned long long)bandwidth.upload_bytes, (unsigned long long)bandwidth.download_bytes);
     httpd_resp_sendstr_chunk(req, chunk);
     return httpd_resp_sendstr_chunk(req, NULL);
 }
@@ -881,8 +882,9 @@ static int open_direct_udp_stream(uint32_t destination_ip, uint16_t destination_
         return -1;
     }
     int                socket_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    struct sockaddr_in address   = {
-        .sin_family = AF_INET, .sin_port = htons(destination_port), .sin_addr.s_addr = destination_ip};
+    struct sockaddr_in address   = {.sin_family      = AF_INET,
+                                    .sin_port        = htons(destination_port),
+                                    .sin_addr.s_addr = destination_ip};
     if (socket_fd < 0 || connect(socket_fd, (struct sockaddr *)&address, sizeof(address)) != 0)
     {
         if (socket_fd >= 0)
@@ -907,8 +909,8 @@ static bool udp_socket_send_datagram(int socket_fd, const uint8_t *data, size_t 
  * smux version-1 frames. */
 static int open_singmux_session(void)
 {
-    int socket_fd = transport_tcp_open_vless_stream(&s_config, s_has_upstream,
-                                                    "sp.mux.sing-box.arpa", 444);
+    int socket_fd =
+        transport_tcp_open_vless_stream(&s_config, s_has_upstream, "sp.mux.sing-box.arpa", 444);
     if (socket_fd < 0)
     {
         return -1;
@@ -964,7 +966,9 @@ static int open_vless_mux_stream(void)
     if (socket_fd < 0 || connect(socket_fd, addresses->ai_addr, addresses->ai_addrlen) != 0)
     {
         if (socket_fd >= 0)
+        {
             close(socket_fd);
+        }
         freeaddrinfo(addresses);
         return -1;
     }
@@ -1119,7 +1123,7 @@ static bool dns_direct_query(uint8_t *packet, int *bytes)
     {
         return false;
     }
-    const char *resolver = s_config.dns_resolver[0] ? s_config.dns_resolver : NULL;
+    const char *resolver        = s_config.dns_resolver[0] ? s_config.dns_resolver : NULL;
     char        resolver_ip[16] = "";
     if (!resolver && s_sta_netif)
     {
@@ -1149,7 +1153,8 @@ static bool dns_direct_query(uint8_t *packet, int *bytes)
     struct timeval timeout = {.tv_sec = 3, .tv_usec = 0};
     setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-    bool ok = sendto(socket_fd, packet, *bytes, 0, addresses->ai_addr, addresses->ai_addrlen) == *bytes;
+    bool ok =
+        sendto(socket_fd, packet, *bytes, 0, addresses->ai_addr, addresses->ai_addrlen) == *bytes;
     if (ok)
     {
         int response_length = recv(socket_fd, packet, 512, 0);
@@ -1293,8 +1298,7 @@ static void socks_client_task(void *arg)
     }
     uint16_t destination_port = ((uint16_t)port_bytes[0] << 8) | port_bytes[1];
     ESP_LOGI(TAG, "SOCKS CONNECT %s:%u", host, destination_port);
-    int     tunnel  = transport_tcp_open_vless_stream(&s_config, s_has_upstream, host,
-                                                      destination_port);
+    int tunnel = transport_tcp_open_vless_stream(&s_config, s_has_upstream, host, destination_port);
     uint8_t reply[] = {5, tunnel >= 0 ? 0 : 1, 0, 1, 0, 0, 0, 0, 0, 0};
     if (!socket_send_all(client, reply, sizeof(reply)) || tunnel < 0)
     {
@@ -1508,8 +1512,7 @@ static void transparent_client_task(void *arg)
                 else
                 {
                     tunnel = transport_tcp_open_domain(s_transparent_mode, &s_config,
-                                                       s_has_upstream, host,
-                                                       flow.original_port);
+                                                       s_has_upstream, host, flow.original_port);
                 }
             }
         }
@@ -1527,9 +1530,8 @@ static void transparent_client_task(void *arg)
             }
             else
             {
-                tunnel = transport_tcp_open_domain(s_transparent_mode, &s_config,
-                                                   s_has_upstream, host,
-                                                   flow.original_port);
+                tunnel = transport_tcp_open_domain(s_transparent_mode, &s_config, s_has_upstream,
+                                                   host, flow.original_port);
             }
         }
     }
@@ -1546,9 +1548,8 @@ static void transparent_client_task(void *arg)
             }
             else
             {
-                tunnel = transport_tcp_open_domain(s_transparent_mode, &s_config,
-                                                   s_has_upstream, host,
-                                                   flow.original_port);
+                tunnel = transport_tcp_open_domain(s_transparent_mode, &s_config, s_has_upstream,
+                                                   host, flow.original_port);
             }
         }
     }
@@ -1570,12 +1571,11 @@ static void transparent_client_task(void *arg)
         ESP_LOGI(TAG, "transparent flow opening %s IPv4 destination port %u",
                  use_vless ? "VLESS" : "upstream", flow.original_port);
         tunnel = transport_tcp_open_ipv4(s_transparent_mode, &s_config, s_has_upstream,
-                         flow.original_ip, flow.original_port);
+                                         flow.original_ip, flow.original_port);
     }
     if (tunnel < 0)
     {
-        ESP_LOGW(TAG, "transparent %s connection failed",
-                 use_vless ? "VLESS" : "upstream");
+        ESP_LOGW(TAG, "transparent %s connection failed", use_vless ? "VLESS" : "upstream");
         goto done;
     }
     if (!socket_send_all(tunnel, initial, initial_length))
@@ -1583,8 +1583,8 @@ static void transparent_client_task(void *arg)
         close(tunnel);
         goto done;
     }
-    transport_tcp_relay(s_transparent_mode, client, tunnel, "transparent",
-                        bandwidth_record_upload, bandwidth_record_download);
+    transport_tcp_relay(s_transparent_mode, client, tunnel, "transparent", bandwidth_record_upload,
+                        bandwidth_record_download);
     close(tunnel);
 done:
     if (peer.sin_addr.s_addr && peer_port)
@@ -1748,7 +1748,9 @@ static void udp_association_release(int slot)
     if (slot >= 0 && slot < UDP_ASSOCIATION_MAX && s_udp_associations[slot].in_use)
     {
         if (s_udp_associations[slot].tunnel >= 0)
+        {
             close(s_udp_associations[slot].tunnel);
+        }
         free(s_udp_associations[slot].rx_buffer);
         if (s_udp_active_associations)
         {
@@ -1905,9 +1907,8 @@ static bool direct_udp_receive_available(udp_association_t *association)
 static void singmux_process_control(void)
 {
     singmux_control_t control;
-    for (size_t processed = 0;
-         processed < SINGMUX_CONTROL_BATCH_MAX && s_singmux_control_queue &&
-         xQueueReceive(s_singmux_control_queue, &control, 0) == pdTRUE;
+    for (size_t processed = 0; processed < SINGMUX_CONTROL_BATCH_MAX && s_singmux_control_queue &&
+                               xQueueReceive(s_singmux_control_queue, &control, 0) == pdTRUE;
          ++processed)
     {
         if (control.type == SINGMUX_CONTROL_OPEN)
@@ -2206,8 +2207,7 @@ static void transparent_udp_manager_task(void *arg)
             FD_SET(s_singmux_tunnel, &reads);
             max_fd = s_singmux_tunnel;
         }
-        for (int i = 0; (!use_vless || !s_config.singmux_enabled) && i < UDP_ASSOCIATION_MAX;
-             ++i)
+        for (int i = 0; (!use_vless || !s_config.singmux_enabled) && i < UDP_ASSOCIATION_MAX; ++i)
         {
             if (s_udp_associations[i].in_use && s_udp_associations[i].tunnel >= 0)
             {
@@ -2252,8 +2252,7 @@ static void transparent_udp_manager_task(void *arg)
                         s_udp_tunnel_failures++;
                         ESP_LOGW(TAG,
                                  "transparent %s UDP association closed for remote UDP port %u",
-                                 use_vless ? "XUDP" : "upstream",
-                                 association->flow.original_port);
+                                 use_vless ? "XUDP" : "upstream", association->flow.original_port);
                         udp_association_release(i);
                     }
                 }
@@ -2292,8 +2291,7 @@ static void transparent_udp_server_task(void *arg)
         vTaskDelete(NULL);
     }
     xTaskCreate(transparent_udp_manager_task, "transparent_xudp_mgr", 6144, NULL, 5, NULL);
-    ESP_LOGI(TAG, "transparent UDP relay listening on UDP port %u",
-             TRANSPARENT_UDP_RELAY_PORT);
+    ESP_LOGI(TAG, "transparent UDP relay listening on UDP port %u", TRANSPARENT_UDP_RELAY_PORT);
     for (;;)
     {
         udp_datagram_t *datagram =
@@ -2450,7 +2448,9 @@ static esp_err_t vless_test_get(httpd_req_t *req)
         }
     }
     if (socket_fd >= 0)
+    {
         close(socket_fd);
+    }
     ESP_LOGI(TAG, "%s", message);
     char response[180];
     snprintf(response, sizeof(response), "{\"message\":\"%s\"}", message);
@@ -2535,14 +2535,14 @@ static esp_err_t config_post(httpd_req_t *req)
     {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Incomplete request");
     }
-    char            port_text[8]   = {0};
-    char            vless_uri[256] = {0};
+    char            port_text[8]       = {0};
+    char            vless_uri[256]     = {0};
     char            password_value[65] = {0};
     char            open_network[8]    = {0};
     bool            have_password      = false;
     bool            open_requested     = false;
-    router_config_t previous       = s_config;
-    router_config_t candidate      = s_config;
+    router_config_t previous           = s_config;
+    router_config_t candidate          = s_config;
     if (section == CONFIG_SECTION_UPSTREAM)
     {
         have_password  = form_value(body, "password", password_value, sizeof(password_value));
@@ -2565,12 +2565,11 @@ static esp_err_t config_post(httpd_req_t *req)
     if (section == CONFIG_SECTION_ACCESS_POINT)
     {
         if (!candidate.ap_ssid[0] || strlen(candidate.ap_password) < 8 ||
-            !parse_access_point_ipv4(configured_or_default(candidate.ap_ip, DEFAULT_AP_IPV4),
-                                     NULL))
+            !parse_access_point_ipv4(configured_or_default(candidate.ap_ip, DEFAULT_AP_IPV4), NULL))
         {
-            return httpd_resp_send_err(
-                req, HTTPD_400_BAD_REQUEST,
-                "AP SSID, an AP password of at least 8 characters, and an IPv4 address ending in .1 are required");
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                       "AP SSID, an AP password of at least 8 characters, and an "
+                                       "IPv4 address ending in .1 are required");
         }
     }
     else if (section == CONFIG_SECTION_UPSTREAM)
@@ -2619,13 +2618,13 @@ static esp_err_t config_post(httpd_req_t *req)
     }
     if (section == CONFIG_SECTION_UPSTREAM)
     {
-        bool password_changed = text_changed(previous.upstream_password, s_config.upstream_password);
+        bool password_changed =
+            text_changed(previous.upstream_password, s_config.upstream_password);
         ESP_LOGI(TAG, "Saved upstream Wi-Fi SSID '%s' to NVS", s_config.upstream_ssid);
-        ESP_LOGI(TAG,
-                 "Web config: upstream saved ssid='%s' open=%s password_%s saved_profiles=%u",
+        ESP_LOGI(TAG, "Web config: upstream saved ssid='%s' open=%s password_%s saved_profiles=%u",
                  s_config.upstream_ssid, s_config.upstream_password[0] ? "no" : "yes",
-                  password_changed ? "changed" : "unchanged",
-                  (unsigned)s_config.upstream_network_count);
+                 password_changed ? "changed" : "unchanged",
+                 (unsigned)s_config.upstream_network_count);
         if (s_configuration_mode)
         {
             s_configuration_mode = false;
@@ -2641,32 +2640,28 @@ static esp_err_t config_post(httpd_req_t *req)
     }
     if (section == CONFIG_SECTION_ACCESS_POINT)
     {
-        ESP_LOGI(TAG,
-                 "Web config: AP saved ssid='%s'%s%s%s gateway='%s'",
-                 s_config.ap_ssid,
+        ESP_LOGI(TAG, "Web config: AP saved ssid='%s'%s%s%s gateway='%s'", s_config.ap_ssid,
                  text_changed(previous.ap_ssid, s_config.ap_ssid) ? " ssid_changed" : "",
                  text_changed(previous.ap_password, s_config.ap_password) ? " password_changed"
-                                                                   : "",
+                                                                          : "",
                  text_changed(previous.ap_ip, s_config.ap_ip) ? " gateway_changed" : "",
                  configured_ap_ipv4(&s_config));
-        esp_err_t response = send_json(
-            req,
-            "{\"message\":\"Access point saved. Reconnect using the updated Wi-Fi settings and gateway.\"}");
+        esp_err_t response = send_json(req, "{\"message\":\"Access point saved. Reconnect using "
+                                            "the updated Wi-Fi settings and gateway.\"}");
         if (response == ESP_OK &&
             xTaskCreate(apply_access_point_task, "apply_ap", 2048, NULL, 3, NULL) != pdPASS)
         {
-            ESP_LOGW(TAG, "Access point settings saved, but deferred AP apply task could not start");
+            ESP_LOGW(TAG,
+                     "Access point settings saved, but deferred AP apply task could not start");
         }
         return response;
     }
-    ESP_LOGI(TAG,
-             "Web config: VLESS saved host='%s' port=%u dns='%s' mux=%s%s%s%s",
+    ESP_LOGI(TAG, "Web config: VLESS saved host='%s' port=%u dns='%s' mux=%s%s%s%s",
              s_config.vless_host, s_config.vless_port, s_config.dns_resolver,
              s_config.singmux_enabled ? "on" : "off",
              text_changed(previous.vless_host, s_config.vless_host) ? " host_changed" : "",
              previous.vless_port != s_config.vless_port ? " port_changed" : "",
-             text_changed(previous.dns_resolver, s_config.dns_resolver) ? " dns_changed"
-                                                                        : "",
+             text_changed(previous.dns_resolver, s_config.dns_resolver) ? " dns_changed" : "",
              previous.singmux_enabled != s_config.singmux_enabled ? " mux_changed" : "");
     return send_json(req, "{\"message\":\"VLESS configuration saved.\"}");
 }
@@ -2769,7 +2764,8 @@ static esp_err_t scan_get(httpd_req_t *req)
         int existing = -1;
         for (int index = 0; index < s_scan_record_count; ++index)
         {
-            if (strcmp((const char *)s_scan_records[index].ssid, (const char *)records[i].ssid) == 0)
+            if (strcmp((const char *)s_scan_records[index].ssid, (const char *)records[i].ssid) ==
+                0)
             {
                 existing = index;
                 break;
@@ -2789,8 +2785,8 @@ static esp_err_t scan_get(httpd_req_t *req)
     for (int i = 0; i < s_scan_record_count; ++i)
     {
         ESP_LOGI(TAG, "AP %d: SSID='%s', RSSI=%d dBm, channel=%u, auth=%d", i + 1,
-                  (const char *)s_scan_records[i].ssid, s_scan_records[i].rssi,
-                  s_scan_records[i].primary, s_scan_records[i].authmode);
+                 (const char *)s_scan_records[i].ssid, s_scan_records[i].rssi,
+                 s_scan_records[i].primary, s_scan_records[i].authmode);
     }
     s_scan_results_available = true;
     return send_scan_results(req);
@@ -2914,7 +2910,7 @@ static esp_err_t upstream_delete_post(httpd_req_t *req)
         return httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Saved upstream profile not found");
     }
 
-    s_config = candidate;
+    s_config             = candidate;
     esp_err_t save_error = save_router_config(&s_config);
     if (save_error != ESP_OK)
     {
@@ -2925,7 +2921,8 @@ static esp_err_t upstream_delete_post(httpd_req_t *req)
 
     if (s_config.upstream_ssid[0])
     {
-        ESP_LOGI(TAG, "Web config: upstream profile deleted ssid='%s' next_active='%s' remaining=%u",
+        ESP_LOGI(TAG,
+                 "Web config: upstream profile deleted ssid='%s' next_active='%s' remaining=%u",
                  ssid, s_config.upstream_ssid, (unsigned)s_config.upstream_network_count);
         ESP_LOGI(TAG, "Deleted upstream Wi-Fi profile '%s'; connecting to '%s'", ssid,
                  s_config.upstream_ssid);
@@ -2953,13 +2950,12 @@ static void start_http_server(void)
     ESP_ERROR_CHECK(httpd_start(&server, &config));
     const httpd_uri_t root    = {.uri = "/", .method = HTTP_GET, .handler = root_get};
     const httpd_uri_t cfg_get = {.uri = "/api/config", .method = HTTP_GET, .handler = config_get};
-    const httpd_uri_t upstream_post      = {.uri      = "/api/upstream",
-                                            .method   = HTTP_POST,
-                                            .handler  = config_post,
-                                            .user_ctx = (void *)CONFIG_SECTION_UPSTREAM};
-    const httpd_uri_t upstream_delete    = {.uri = "/api/upstream-delete",
-                                            .method = HTTP_POST,
-                                            .handler = upstream_delete_post};
+    const httpd_uri_t upstream_post   = {.uri      = "/api/upstream",
+                                         .method   = HTTP_POST,
+                                         .handler  = config_post,
+                                         .user_ctx = (void *)CONFIG_SECTION_UPSTREAM};
+    const httpd_uri_t upstream_delete = {
+        .uri = "/api/upstream-delete", .method = HTTP_POST, .handler = upstream_delete_post};
     const httpd_uri_t vless_post         = {.uri      = "/api/vless",
                                             .method   = HTTP_POST,
                                             .handler  = config_post,
@@ -2974,7 +2970,7 @@ static void start_http_server(void)
         .uri = "/api/test-vless", .method = HTTP_GET, .handler = vless_test_get};
     const httpd_uri_t xudp_test = {
         .uri = "/api/test-xudp", .method = HTTP_GET, .handler = xudp_test_get};
-    const httpd_uri_t scan    = {.uri = "/api/scan", .method = HTTP_GET, .handler = scan_get};
+    const httpd_uri_t scan         = {.uri = "/api/scan", .method = HTTP_GET, .handler = scan_get};
     const httpd_uri_t scan_results = {
         .uri = "/api/scan-results", .method = HTTP_GET, .handler = scan_results_get};
     const httpd_uri_t ota     = {.uri = "/api/ota", .method = HTTP_POST, .handler = ota_post};
@@ -3027,8 +3023,8 @@ static bool dns_vless_query(uint8_t *packet, int *bytes)
     {
         return false;
     }
-    int tunnel = transport_tcp_open_vless_stream(&s_config, s_has_upstream,
-                                                 s_config.dns_resolver, 53);
+    int tunnel =
+        transport_tcp_open_vless_stream(&s_config, s_has_upstream, s_config.dns_resolver, 53);
     if (tunnel < 0)
     {
         return false;
@@ -3063,7 +3059,7 @@ static bool dns_vless_query(uint8_t *packet, int *bytes)
     {
         return false;
     }
-    *bytes             = response_length;
+    *bytes = response_length;
     dns_cache_response_records(packet, *bytes);
     return true;
 }
@@ -3112,23 +3108,23 @@ static void captive_dns_task(void *arg)
         packet[6] = 0;
         packet[7] = 1;
         packet[8] = packet[9] = packet[10] = packet[11] = 0;
-        uint32_t ap_ip = access_point_ipv4_addr();
-        const uint8_t answer[] = {0xc0,
-                                  0x0c,
-                                  0x00,
-                                  0x01,
-                                  0x00,
-                                  0x01,
-                                  0x00,
-                                  0x00,
-                                  0x00,
-                                  0x3c,
-                                  0x00,
-                                  0x04,
-                                  (uint8_t)(ap_ip & 0xff),
-                                  (uint8_t)((ap_ip >> 8) & 0xff),
-                                  (uint8_t)((ap_ip >> 16) & 0xff),
-                                  (uint8_t)((ap_ip >> 24) & 0xff)};
+        uint32_t      ap_ip                             = access_point_ipv4_addr();
+        const uint8_t answer[]                          = {0xc0,
+                                                           0x0c,
+                                                           0x00,
+                                                           0x01,
+                                                           0x00,
+                                                           0x01,
+                                                           0x00,
+                                                           0x00,
+                                                           0x00,
+                                                           0x3c,
+                                                           0x00,
+                                                           0x04,
+                                                           (uint8_t)(ap_ip & 0xff),
+                                                           (uint8_t)((ap_ip >> 8) & 0xff),
+                                                           (uint8_t)((ap_ip >> 16) & 0xff),
+                                                           (uint8_t)((ap_ip >> 24) & 0xff)};
         if (qend + (int)sizeof(answer) <= sizeof(packet))
         {
             memcpy(packet + qend, answer, sizeof(answer));
@@ -3174,7 +3170,8 @@ static void enter_configuration_mode(void)
     esp_wifi_disconnect();
     if (xTaskCreate(apply_access_point_task, "config_ap", 2048, NULL, 3, NULL) != pdPASS)
     {
-        ESP_LOGW(TAG, "Configuration mode enabled, but setup AP channel reset task could not start");
+        ESP_LOGW(TAG,
+                 "Configuration mode enabled, but setup AP channel reset task could not start");
     }
 }
 
@@ -3205,9 +3202,8 @@ static void factory_reset_button_task(void *arg)
             if (gpio_get_level(BOOT_BUTTON_GPIO) != 0)
             {
                 armed_after_release = true;
-                ESP_LOGI(
-                    TAG,
-                    "BOOT button ready: short click toggles routing; one-second hold enters configuration mode; five-second hold factory-resets");
+                ESP_LOGI(TAG, "BOOT button ready: short click toggles routing; one-second hold "
+                              "enters configuration mode; five-second hold factory-resets");
             }
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
@@ -3217,8 +3213,9 @@ static void factory_reset_button_task(void *arg)
             held_ticks++;
             if (held_ticks == 1)
             {
-                ESP_LOGI(TAG, "BOOT pressed; release within 1 second to toggle routing, hold 1 second "
-                               "for configuration mode, or 5 seconds to factory reset");
+                ESP_LOGI(TAG,
+                         "BOOT pressed; release within 1 second to toggle routing, hold 1 second "
+                         "for configuration mode, or 5 seconds to factory reset");
             }
             if (held_ticks == 20)
             {
@@ -3252,7 +3249,7 @@ static void factory_reset_button_task(void *arg)
                                                                    : TRANSPARENT_MODE_VLESS);
                 ESP_LOGI(TAG, "Short BOOT click: %s mode",
                          transparent_mode_uses_vless() ? "transparent VLESS router"
-                                                        : "transparent upstream router");
+                                                       : "transparent upstream router");
             }
             else if (held_ticks > 0 && reset_warning_shown)
             {
@@ -3334,11 +3331,11 @@ static void serial_console_task(void *arg)
         if (strcmp(command, "status") == 0)
         {
             ESP_LOGI(TAG,
-                     "AP='%s' ip='%s'; upstream='%s'; mode='%s'; VLESS host='%s' port=%u; DNS='%s'; smux=%s",
+                     "AP='%s' ip='%s'; upstream='%s'; mode='%s'; VLESS host='%s' port=%u; "
+                     "DNS='%s'; smux=%s",
                      configured_or_default(s_config.ap_ssid, AP_SSID),
-                     configured_ap_ipv4(&s_config),
-                     s_config.upstream_ssid, transparent_mode_name(), s_config.vless_host,
-                     s_config.vless_port, s_config.dns_resolver,
+                     configured_ap_ipv4(&s_config), s_config.upstream_ssid, transparent_mode_name(),
+                     s_config.vless_host, s_config.vless_port, s_config.dns_resolver,
                      s_config.singmux_enabled ? "enabled" : "disabled");
             continue;
         }
