@@ -15,6 +15,7 @@
 #include "esp_netif.h"
 #include "esp_netif_net_stack.h"
 #include "esp_ota_ops.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "driver/gpio.h"
@@ -964,6 +965,11 @@ static esp_err_t config_get(httpd_req_t *req)
     }
     bandwidth_stats_t bandwidth          = bandwidth_snapshot();
     uint32_t          singmux_tcp_active = 0;
+    uint32_t          free_internal      = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    uint32_t          largest_internal_block =
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    uint32_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    uint32_t free_total = esp_get_free_heap_size();
     for (size_t index = 0; index < SINGMUX_TCP_STREAM_MAX; ++index)
     {
         if (s_singmux_tcp_streams[index].in_use)
@@ -1022,7 +1028,9 @@ static esp_err_t config_get(httpd_req_t *req)
         "\"dns\":\"%s\",\"xudp_active\":%u,\"xudp_queued\":%u,\"xudp_dropped\":%u,"
         "\"xudp_rx_dropped\":%u,\"xudp_tunnel_failures\":%u,\"transparent_tcp_max\":%u,"
         "\"singmux_connected\":%s,\"singmux_tcp_active\":%u,\"singmux_control_queued\":%u,"
-        "\"up_bps\":%u,\"down_bps\":%u,\"up_bytes\":%llu,\"down_bytes\":%llu}",
+        "\"up_bps\":%u,\"down_bps\":%u,\"up_bytes\":%llu,\"down_bytes\":%llu,"
+        "\"free_internal\":%u,\"largest_internal_block\":%u,\"free_psram\":%u,"
+        "\"free_total\":%u}",
         s_config.vless_host, s_config.vless_port, s_config.dns_resolver,
         s_config.singmux_enabled ? "true" : "false", transparent_mode_name(),
         s_has_upstream ? "true" : "false", ip, gateway, netmask, dns_server,
@@ -1033,7 +1041,9 @@ static esp_err_t config_get(httpd_req_t *req)
         (unsigned)singmux_tcp_active,
         s_singmux_control_queue ? (unsigned)uxQueueMessagesWaiting(s_singmux_control_queue) : 0,
         (unsigned)bandwidth.upload_bps, (unsigned)bandwidth.download_bps,
-        (unsigned long long)bandwidth.upload_bytes, (unsigned long long)bandwidth.download_bytes);
+        (unsigned long long)bandwidth.upload_bytes, (unsigned long long)bandwidth.download_bytes,
+        (unsigned)free_internal, (unsigned)largest_internal_block, (unsigned)free_psram,
+        (unsigned)free_total);
     httpd_resp_sendstr_chunk(req, chunk);
     return httpd_resp_sendstr_chunk(req, NULL);
 }
