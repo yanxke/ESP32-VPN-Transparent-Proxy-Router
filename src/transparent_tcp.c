@@ -597,6 +597,7 @@ bool transparent_tcp_create_or_get(uint32_t client_ip, uint16_t client_port, uin
     if (entry)
     {
         if (!entry->in_use)
+        {
             *entry = (transparent_tcp_flow_t){.in_use        = true,
                                               .client_ip     = client_ip,
                                               .client_port   = client_port,
@@ -604,6 +605,7 @@ bool transparent_tcp_create_or_get(uint32_t client_ip, uint16_t client_port, uin
                                               .original_port = original_port,
                                               .last_activity_ms =
                                                   (uint32_t)(esp_timer_get_time() / 1000)};
+        }
         if (flow)
         {
             *flow = *entry;
@@ -619,7 +621,9 @@ void transparent_tcp_touch(uint32_t client_ip, uint16_t client_port)
     portENTER_CRITICAL(&s_flow_lock);
     transparent_tcp_flow_t *entry = flow_find_locked(client_ip, client_port);
     if (entry)
+    {
         entry->last_activity_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    }
     portEXIT_CRITICAL(&s_flow_lock);
 }
 
@@ -639,7 +643,9 @@ void transparent_tcp_remove(uint32_t client_ip, uint16_t client_port)
     portENTER_CRITICAL(&s_flow_lock);
     transparent_tcp_flow_t *entry = flow_find_locked(client_ip, client_port);
     if (entry)
+    {
         memset(entry, 0, sizeof(*entry));
+    }
     portEXIT_CRITICAL(&s_flow_lock);
 }
 
@@ -703,6 +709,7 @@ bool transparent_udp_create_or_get(uint32_t client_ip, uint16_t client_port, uin
     if (entry)
     {
         if (!entry->in_use)
+        {
             *entry = (transparent_udp_flow_t){.in_use        = true,
                                               .client_ip     = client_ip,
                                               .client_port   = client_port,
@@ -710,6 +717,7 @@ bool transparent_udp_create_or_get(uint32_t client_ip, uint16_t client_port, uin
                                               .original_port = original_port,
                                               .last_activity_ms =
                                                   (uint32_t)(esp_timer_get_time() / 1000)};
+        }
         if (flow)
         {
             *flow = *entry;
@@ -725,7 +733,9 @@ void transparent_udp_touch(uint32_t client_ip, uint16_t client_port)
     portENTER_CRITICAL(&s_flow_lock);
     transparent_udp_flow_t *entry = udp_flow_find_locked(client_ip, client_port);
     if (entry)
+    {
         entry->last_activity_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    }
     portEXIT_CRITICAL(&s_flow_lock);
 }
 

@@ -87,6 +87,8 @@ bool xudp_decode_header(const uint8_t *metadata, size_t metadata_length, uint8_t
         *source_port = ((uint16_t)metadata[5] << 8) | metadata[6];
     }
     if (source_ip)
+    {
         memcpy(source_ip, metadata + 8, 4);
+    }
     return true;
 }
