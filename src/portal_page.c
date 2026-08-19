@@ -3,7 +3,7 @@
 const char *portal_page_html(void)
 {
     static const char page[] =
-        "<!doctype html><html><head><meta name=viewport "
+        "<!doctype html><html><head><meta charset=utf-8><meta name=viewport "
         "content='width=device-width,initial-scale=1'><title>ESP32 VLESS Router</title>"
         "<style>body{font:16px system-ui;max-width:680px;margin:2rem auto;padding:0 "
         "1rem;color:#17212b}h1{color:#0b6e4f}fieldset{border:1px solid "
