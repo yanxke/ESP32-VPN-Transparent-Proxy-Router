@@ -116,6 +116,7 @@ typedef struct
 {
     singmux_control_type_t type;
     int                    slot;
+    uint32_t               stream_id;
     TaskHandle_t           reply_task;
     uint32_t               destination_ip;
     uint16_t               destination_port;
@@ -1585,7 +1586,7 @@ static int singmux_tcp_open(uint32_t destination_ip, const char *destination_nam
     return (int)answer - 1;
 }
 
-static bool singmux_tcp_queue_data(int slot, const uint8_t *data, size_t length)
+static bool singmux_tcp_queue_data(int slot, uint32_t stream_id, const uint8_t *data, size_t length)
 {
     if (slot < 0 || length > SINGMUX_TCP_DATA_MAX || !s_singmux_control_queue)
     {
@@ -1599,7 +1600,10 @@ static bool singmux_tcp_queue_data(int slot, const uint8_t *data, size_t length)
     }
     copy->length = length;
     memcpy(copy->data, data, length);
-    singmux_control_t control = {.type = SINGMUX_CONTROL_DATA, .slot = slot, .data = copy};
+    singmux_control_t control = {.type      = SINGMUX_CONTROL_DATA,
+                                 .slot      = slot,
+                                 .stream_id = stream_id,
+                                 .data      = copy};
     if (xQueueSend(s_singmux_control_queue, &control, pdMS_TO_TICKS(250)) != pdTRUE)
     {
         free(copy);
@@ -1608,18 +1612,41 @@ static bool singmux_tcp_queue_data(int slot, const uint8_t *data, size_t length)
     return true;
 }
 
-static void singmux_tcp_close(int slot)
+/* A close is acknowledged only after the manager has detached the stream.
+ * This lets the relay, which owns the queue allocation, delete it safely. */
+static bool singmux_tcp_close(int slot, uint32_t stream_id)
 {
-    if (!s_singmux_control_queue)
+    if (!s_singmux_control_queue || slot < 0)
     {
-        return;
+        return false;
     }
-    singmux_control_t control = {.type = SINGMUX_CONTROL_CLOSE, .slot = slot};
-    (void)xQueueSend(s_singmux_control_queue, &control, pdMS_TO_TICKS(250));
+    singmux_control_t control = {.type       = SINGMUX_CONTROL_CLOSE,
+                                 .slot       = slot,
+                                 .stream_id  = stream_id,
+                                 .reply_task = xTaskGetCurrentTaskHandle()};
+    if (xQueueSend(s_singmux_control_queue, &control, pdMS_TO_TICKS(250)) != pdTRUE)
+    {
+        return false;
+    }
+    uint32_t answer = 0;
+    return xTaskNotifyWait(0, UINT32_MAX, &answer, pdMS_TO_TICKS(1000)) == pdTRUE && answer;
 }
 
 static void relay_singmux_tcp_stream(int client, int slot)
 {
+    if (slot < 0 || slot >= SINGMUX_TCP_STREAM_MAX)
+    {
+        return;
+    }
+    /* The manager does not delete this queue after a successful open.  Take a
+     * private handle before relaying so a detached slot can be reused safely. */
+    QueueHandle_t receive_queue = s_singmux_tcp_streams[slot].receive_queue;
+    uint32_t      stream_id     = s_singmux_tcp_streams[slot].stream_id;
+    if (!receive_queue || !stream_id)
+    {
+        return;
+    }
+    bool detached = false;
     for (;;)
     {
         fd_set reads;
@@ -1631,33 +1658,39 @@ static void relay_singmux_tcp_stream(int client, int slot)
         {
             uint8_t buffer[1024];
             int     count = recv(client, buffer, sizeof(buffer), 0);
-            if (count <= 0 || !singmux_tcp_queue_data(slot, buffer, count))
+            if (count <= 0 || !singmux_tcp_queue_data(slot, stream_id, buffer, count))
             {
                 break;
             }
         }
-        if (slot < 0 || slot >= SINGMUX_TCP_STREAM_MAX || !s_singmux_tcp_streams[slot].in_use)
-        {
-            break;
-        }
         singmux_tcp_data_t *item = NULL;
-        while (xQueueReceive(s_singmux_tcp_streams[slot].receive_queue, &item, 0) == pdTRUE)
+        while (xQueueReceive(receive_queue, &item, 0) == pdTRUE)
         {
             if (!item)
             {
-                singmux_tcp_close(slot);
-                return;
+                detached = singmux_tcp_close(slot, stream_id);
+                goto done;
             }
             bool ok = socket_send_all(client, item->data, item->length);
             free(item);
             if (!ok)
             {
-                singmux_tcp_close(slot);
-                return;
+                goto close_stream;
             }
         }
     }
-    singmux_tcp_close(slot);
+close_stream:
+    detached = singmux_tcp_close(slot, stream_id);
+done:
+    if (detached)
+    {
+        singmux_tcp_data_t *item = NULL;
+        while (xQueueReceive(receive_queue, &item, 0) == pdTRUE)
+        {
+            free(item);
+        }
+        vQueueDelete(receive_queue);
+    }
 }
 
 static void transparent_client_task(void *arg)
@@ -1857,7 +1890,20 @@ static int singmux_tcp_stream_find(uint32_t stream_id)
     return -1;
 }
 
-static void singmux_tcp_stream_release(int slot)
+/* The relay task owns a queue after OPEN succeeds.  The manager only detaches
+ * the slot; the acknowledged relay then drains and deletes its own queue. */
+static void singmux_tcp_stream_detach(int slot)
+{
+    if (slot < 0 || slot >= SINGMUX_TCP_STREAM_MAX || !s_singmux_tcp_streams[slot].in_use)
+    {
+        return;
+    }
+    memset(&s_singmux_tcp_streams[slot], 0, sizeof(s_singmux_tcp_streams[slot]));
+}
+
+/* OPEN can fail before its caller receives a slot.  In that case no relay owns
+ * the queue, so the manager must reclaim it itself. */
+static void singmux_tcp_stream_discard(int slot)
 {
     if (slot < 0 || slot >= SINGMUX_TCP_STREAM_MAX || !s_singmux_tcp_streams[slot].in_use)
     {
@@ -1918,8 +1964,8 @@ static bool singmux_tcp_notify_closed(int slot)
 {
     singmux_tcp_data_t   *end    = NULL;
     singmux_tcp_stream_t *stream = &s_singmux_tcp_streams[slot];
-    stream->peer_closed          = true;
-    return xQueueSend(stream->receive_queue, &end, 0) == pdTRUE;
+    stream->peer_closed = true;
+    return stream->receive_queue && xQueueSend(stream->receive_queue, &end, 0) == pdTRUE;
 }
 
 static void singmux_tcp_notify_all_closed(void)
@@ -2184,12 +2230,13 @@ static void singmux_process_control(void)
             free(control.data);
             if (!ok && slot >= 0)
             {
-                singmux_tcp_stream_release(slot);
+                singmux_tcp_stream_discard(slot);
             }
             xTaskNotify(control.reply_task, ok ? (uint32_t)(slot + 1) : 0, eSetValueWithOverwrite);
         }
         else if (control.slot >= 0 && control.slot < SINGMUX_TCP_STREAM_MAX &&
-                 s_singmux_tcp_streams[control.slot].in_use)
+                 s_singmux_tcp_streams[control.slot].in_use &&
+                 s_singmux_tcp_streams[control.slot].stream_id == control.stream_id)
         {
             singmux_tcp_stream_t *stream = &s_singmux_tcp_streams[control.slot];
             bool                  ok     = s_singmux_tunnel >= 0;
@@ -2208,12 +2255,15 @@ static void singmux_process_control(void)
                 {
                     singmux_send_frame(s_singmux_tunnel, SMUX_CMD_FIN, stream->stream_id, NULL, 0);
                 }
-                singmux_tcp_stream_release(control.slot);
+                singmux_tcp_stream_detach(control.slot);
+                xTaskNotify(control.reply_task, 1, eSetValueWithOverwrite);
             }
             free(control.data);
-            if (!ok)
+            if (!ok && control.type == SINGMUX_CONTROL_DATA)
             {
-                singmux_tcp_stream_release(control.slot);
+                /* Keep the queue alive until its relay receives the sentinel
+                 * and acknowledges CLOSE; deleting it here races xQueueReceive. */
+                singmux_tcp_notify_closed(control.slot);
             }
         }
         else
