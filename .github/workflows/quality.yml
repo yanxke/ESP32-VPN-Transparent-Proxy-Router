@@ -23,8 +23,16 @@ jobs:
       - name: Verify control-flow braces
         shell: pwsh
         run: |
-          $sources = @('src/main.c', 'src/transparent_tcp.c', 'src/xudp_codec.c', 'src/singmux_codec.c')
-          $output = clang-tidy -p .pio/build/esp32s3_r8n16 --config-file=.clang-tidy $sources 2>&1 | Out-String
-          if ($output -match 'readability-braces-around-statements') { throw $output }
+          $sources = @(
+            'src/main.c',
+            'src/transparent_tcp.c',
+            'src/xudp_codec.c',
+            'src/singmux_codec.c'
+          )
+          $output = & clang-tidy -p .pio/build/esp32s3_r8n16 --config-file=.clang-tidy $sources 2>&1
+          $exitCode = $LASTEXITCODE
+          $output | ForEach-Object { Write-Host $_ }
+          if ($output -match 'readability-braces-around-statements') { exit 1 }
+          exit $exitCode
       - name: Run static analysis
         run: pio check -e esp32s3_r8n16 --fail-on-defect medium
