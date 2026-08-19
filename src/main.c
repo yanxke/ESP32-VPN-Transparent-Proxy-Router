@@ -154,6 +154,12 @@ static bool                 s_configuration_mode;
 static wifi_ap_record_t     s_scan_records[20];
 static uint16_t             s_scan_record_count;
 static bool                 s_scan_results_available;
+/* The first configured upstream gets its normal connection attempt.  If that
+   fails during boot, scan once for a saved alternative instead of retrying the
+   same unavailable AP forever. */
+static bool                 s_boot_upstream_scan_scheduled;
+static bool                 s_boot_upstream_connected;
+static char                 s_boot_failed_upstream_ssid[33];
 
 static bool socket_send_all(int socket_fd, const uint8_t *data, size_t length);
 static bool socket_recv_all(int socket_fd, uint8_t *data, size_t length);
@@ -162,6 +168,7 @@ static void json_string(httpd_req_t *req, const char *text);
 static void apply_access_point_task(void *argument);
 static void reset_transparent_transport_state(void);
 static void set_transparent_mode(transparent_mode_t mode);
+static void schedule_boot_upstream_scan(void);
 
 static bool text_changed(const char *left, const char *right)
 {
@@ -371,6 +378,122 @@ static void connect_upstream(void)
              s_config.upstream_password, s_config.upstream_password[0] ? "" : " (open network)");
 }
 
+/* Runs outside the Wi-Fi event loop because esp_wifi_scan_start(..., true)
+   blocks until the scan is complete.  Scan all reported APs: limiting the
+   result to the web UI's 20 entries could otherwise miss a weaker, but saved,
+   upstream. */
+static void boot_upstream_scan_task(void *argument)
+{
+    (void)argument;
+    vTaskDelay(pdMS_TO_TICKS(250));
+
+    wifi_scan_config_t scan = {
+        .show_hidden      = false,
+        .scan_type        = WIFI_SCAN_TYPE_ACTIVE,
+        .scan_time.active = {.min = 100, .max = 300},
+    };
+    ESP_LOGI(TAG, "Boot upstream recovery: scanning for saved Wi-Fi networks");
+    esp_err_t err = esp_wifi_scan_start(&scan, true);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "Boot upstream recovery scan failed: %s", esp_err_to_name(err));
+        vTaskDelete(NULL);
+        return;
+    }
+
+    uint16_t count = 0;
+    err            = esp_wifi_scan_get_ap_num(&count);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "Could not read boot scan results: %s", esp_err_to_name(err));
+        vTaskDelete(NULL);
+        return;
+    }
+    wifi_ap_record_t *records = count ? calloc(count, sizeof(*records)) : NULL;
+    if (count && !records)
+    {
+        ESP_LOGW(TAG, "Not enough memory to process %u boot scan results", (unsigned)count);
+        vTaskDelete(NULL);
+        return;
+    }
+    if (count)
+    {
+        err = esp_wifi_scan_get_ap_records(&count, records);
+        if (err != ESP_OK)
+        {
+            ESP_LOGW(TAG, "Could not retrieve boot scan results: %s", esp_err_to_name(err));
+            free(records);
+            vTaskDelete(NULL);
+            return;
+        }
+    }
+
+    int best_profile = -1;
+    int best_rssi    = -127;
+    int best_alternative_profile = -1;
+    int best_alternative_rssi    = -127;
+    for (uint16_t record = 0; record < count; ++record)
+    {
+        for (uint8_t profile = 0;
+             profile < s_config.upstream_network_count && profile < UPSTREAM_NETWORK_MAX; ++profile)
+        {
+            if (strcmp((const char *)records[record].ssid, s_config.upstream_networks[profile].ssid) !=
+                0)
+            {
+                continue;
+            }
+            if (best_profile < 0 || records[record].rssi > best_rssi)
+            {
+                best_profile = profile;
+                best_rssi    = records[record].rssi;
+            }
+            if (strcmp(s_config.upstream_networks[profile].ssid, s_boot_failed_upstream_ssid) != 0 &&
+                (best_alternative_profile < 0 || records[record].rssi > best_alternative_rssi))
+            {
+                best_alternative_profile = profile;
+                best_alternative_rssi    = records[record].rssi;
+            }
+        }
+    }
+    free(records);
+
+    /* Do not immediately retry a profile which already failed at boot when a
+       different saved AP is available. */
+    if (best_alternative_profile >= 0)
+    {
+        best_profile = best_alternative_profile;
+        best_rssi    = best_alternative_rssi;
+    }
+    if (best_profile < 0)
+    {
+        ESP_LOGW(TAG, "Boot upstream recovery: no saved upstream was found in %u AP(s)",
+                 (unsigned)count);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    const upstream_network_t *selected = &s_config.upstream_networks[best_profile];
+    strlcpy(s_config.upstream_ssid, selected->ssid, sizeof(s_config.upstream_ssid));
+    strlcpy(s_config.upstream_password, selected->password, sizeof(s_config.upstream_password));
+    ESP_LOGI(TAG, "Boot upstream recovery: selected saved AP '%s' (%d dBm)",
+             s_config.upstream_ssid, best_rssi);
+    connect_upstream();
+    vTaskDelete(NULL);
+}
+
+static void schedule_boot_upstream_scan(void)
+{
+    if (s_boot_upstream_scan_scheduled || s_configuration_mode)
+    {
+        return;
+    }
+    s_boot_upstream_scan_scheduled = true;
+    if (xTaskCreate(boot_upstream_scan_task, "boot_wifi_scan", 4096, NULL, 4, NULL) != pdPASS)
+    {
+        ESP_LOGW(TAG, "Could not start boot upstream recovery scan task");
+    }
+}
+
 static const char *wifi_disconnect_reason_text(uint8_t reason)
 {
     switch (reason)
@@ -402,12 +525,21 @@ static void network_event(void *arg, esp_event_base_t base, int32_t event, void 
     }
     if (base == WIFI_EVENT && event == WIFI_EVENT_STA_START)
     {
-        connect_upstream();
+        if (s_config.upstream_ssid[0])
+        {
+            connect_upstream();
+        }
+        else
+        {
+            /* This still scans on a first boot with no profiles, making the
+               available networks discoverable in the boot log. */
+            schedule_boot_upstream_scan();
+        }
     }
     if (base == WIFI_EVENT && event == WIFI_EVENT_STA_DISCONNECTED && s_config.upstream_ssid[0])
     {
         const wifi_event_sta_disconnected_t *disconnected = data;
-        ESP_LOGW(TAG, "Upstream '%s' disconnected: %s (reason=%u); retrying",
+        ESP_LOGW(TAG, "Upstream '%s' disconnected: %s (reason=%u)",
                  s_config.upstream_ssid, wifi_disconnect_reason_text(disconnected->reason),
                  (unsigned)disconnected->reason);
         s_has_upstream = false;
@@ -419,7 +551,15 @@ static void network_event(void *arg, esp_event_base_t base, int32_t event, void 
             return;
         }
         status_led_show_mode(s_transparent_mode, s_has_upstream);
-        esp_wifi_connect();
+        if (s_boot_upstream_connected)
+        {
+            ESP_LOGI(TAG, "Retrying established upstream connection");
+            esp_wifi_connect();
+            return;
+        }
+        strlcpy(s_boot_failed_upstream_ssid, s_config.upstream_ssid,
+                sizeof(s_boot_failed_upstream_ssid));
+        schedule_boot_upstream_scan();
     }
     if (base == IP_EVENT && event == IP_EVENT_STA_GOT_IP)
     {
@@ -433,6 +573,7 @@ static void network_event(void *arg, esp_event_base_t base, int32_t event, void 
             return;
         }
         s_has_upstream = true;
+        s_boot_upstream_connected = true;
         refresh_transparent_interception_state();
         status_led_show_mode(s_transparent_mode, s_has_upstream);
         ESP_LOGI(TAG, "Upstream '%s' connected with IP %s; %s", s_config.upstream_ssid, ip,
