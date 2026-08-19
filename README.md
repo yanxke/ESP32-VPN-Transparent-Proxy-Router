@@ -106,6 +106,20 @@ IP (`apip`), VLESS profile (`vless` or `vless-uri`), DNS resolver (`dns`),
 multiplexing (`mux`), and portal password (`admin`). It never prints saved
 passwords or the VLESS UUID.
 
+For throughput diagnosis, start a speed test and enter `diag` twice about one
+second apart. It reports the payload upload/download rate, STA RSSI and channel,
+AP client count, TCP window/buffer configuration, UDP/smux queue pressure,
+dropped datagrams, and free internal/PSRAM. The firmware uses 32 KiB TCP
+receive/send buffers, SACK, 32 Wi-Fi TX buffers, and disables STA modem sleep;
+the previous 5,760-byte TCP windows could limit a VLESS TCP stream to roughly
+1 Mbps at high RTT. Use `route direct` for a same-boot,
+non-VLESS comparison against a China speed-test server, then `route vless` to
+return to the tunnel. **Direct mode sends TCP and UDP to the upstream network
+without VLESS protection** and resets to VLESS on reboot.
+
+If the USB console is unavailable, the authenticated local portal exposes the
+same temporary route test: `POST /api/route` with `mode=direct` or `mode=vless`.
+
 After flashing, join the setup AP and visit the AP gateway at `http://192.168.4.1` by default. Configure the router AP, downstream subnet by setting the ESP32 gateway IP, upstream Wi-Fi, and VLESS profile independently. Do not commit a configured `sdkconfig`, NVS dump, URI, UUID, or Wi-Fi password to a public repository.
 
 For browser-only flashing, every build creates a target-specific image such as `dist/esp32-vless-router-esp32s3_r8n16.bin` or `dist/esp32-vless-router-esp32s3_r8n8.bin`. Follow [Browser-based flashing](docs/WEB_FLASHING.md) to program the image matching your board at address `0x0` using esptool-js. This full image installs the target's OTA partition table and can clear saved configuration; record the router settings first.

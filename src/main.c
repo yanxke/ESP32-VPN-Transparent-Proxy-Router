@@ -161,6 +161,7 @@ static bool dns_name(const uint8_t *packet, int bytes, int *offset, char name[25
 static void json_string(httpd_req_t *req, const char *text);
 static void apply_access_point_task(void *argument);
 static void reset_transparent_transport_state(void);
+static void set_transparent_mode(transparent_mode_t mode);
 
 static bool text_changed(const char *left, const char *right)
 {
@@ -224,6 +225,57 @@ static bandwidth_stats_t bandwidth_snapshot(void)
     stats = (bandwidth_stats_t){s_upload_bytes, s_download_bytes, s_upload_bps, s_download_bps};
     portEXIT_CRITICAL(&s_bandwidth_lock);
     return stats;
+}
+
+/* Safe to call while a speed test is running.  It reports aggregate payload
+   flow without enabling the high-volume packet logging switch. */
+static void serial_diagnostics(void)
+{
+    bandwidth_stats_t bandwidth = bandwidth_snapshot();
+    wifi_ap_record_t  upstream  = {0};
+    uint8_t           primary   = 0;
+    wifi_second_chan_t secondary = WIFI_SECOND_CHAN_NONE;
+    wifi_sta_list_t   clients   = {0};
+    esp_err_t upstream_result   = esp_wifi_sta_get_ap_info(&upstream);
+    esp_err_t client_result     = esp_wifi_ap_get_sta_list(&clients);
+    uint32_t  singmux_tcp_active = 0;
+    (void)esp_wifi_get_channel(&primary, &secondary);
+    for (size_t index = 0; index < SINGMUX_TCP_STREAM_MAX; ++index)
+    {
+        if (s_singmux_tcp_streams[index].in_use)
+        {
+            ++singmux_tcp_active;
+        }
+    }
+
+    ESP_LOGI(TAG,
+             "DIAG route=%s upstream=%s Wi-Fi channel=%u secondary=%d AP-clients=%u; "
+             "TCP wnd=32768 snd=32768 recvmbox=32; payload up=%u B/s down=%u B/s "
+             "(%.2f/%.2f Mbps)",
+             transparent_mode_name(), s_has_upstream ? "up" : "down", primary, (int)secondary,
+             client_result == ESP_OK ? clients.num : 0, bandwidth.upload_bps,
+             bandwidth.download_bps, bandwidth.upload_bps * 8.0 / 1000000.0,
+             bandwidth.download_bps * 8.0 / 1000000.0);
+    if (upstream_result == ESP_OK)
+    {
+        ESP_LOGI(TAG, "DIAG uplink RSSI=%d dBm channel=%u auth=%d", upstream.rssi,
+                 upstream.primary, upstream.authmode);
+    }
+    else
+    {
+        ESP_LOGW(TAG, "DIAG uplink association unavailable: %s", esp_err_to_name(upstream_result));
+    }
+    ESP_LOGI(TAG,
+             "DIAG queues: UDP=%u/%u drops=%u rx_drops=%u tunnel_failures=%u; smux=%s "
+             "TCP-streams=%u/%u control=%u/%u; heap internal=%u PSRAM=%u",
+             s_udp_manager_queue ? (unsigned)uxQueueMessagesWaiting(s_udp_manager_queue) : 0,
+             UDP_MANAGER_QUEUE_DEPTH, (unsigned)s_udp_queue_drops, (unsigned)s_udp_rx_drops,
+             (unsigned)s_udp_tunnel_failures, s_singmux_tunnel >= 0 ? "connected" : "off",
+             (unsigned)singmux_tcp_active, SINGMUX_TCP_STREAM_MAX,
+             s_singmux_control_queue ? (unsigned)uxQueueMessagesWaiting(s_singmux_control_queue) : 0,
+             SINGMUX_CONTROL_QUEUE_DEPTH,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
 
 static bool access_point_ip_info(esp_netif_ip_info_t *info)
@@ -1252,7 +1304,7 @@ static BaseType_t create_stream_task(TaskFunction_t task, const char *name, void
 {
     /* Wi-Fi and lwIP need internal RAM.  Relay task stacks can safely live in
        PSRAM, so connection capacity is not constrained by that scarce heap. */
-    return xTaskCreateWithCaps(task, name, 6144, argument, 5, NULL,
+    return xTaskCreateWithCaps(task, name, 8192, argument, 5, NULL,
                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 }
 
@@ -2666,6 +2718,44 @@ static esp_err_t config_post(httpd_req_t *req)
     return send_json(req, "{\"message\":\"VLESS configuration saved.\"}");
 }
 
+/* Physical serial and the BOOT button already support a temporary direct
+   route.  Expose the same recovery diagnostic through authenticated local
+   management so a held USB console cannot prevent an A/B throughput test. */
+static esp_err_t route_post(httpd_req_t *req)
+{
+    if (require_admin_auth(req) != ESP_OK)
+    {
+        return ESP_FAIL;
+    }
+    if (req->content_len == 0 || req->content_len > 32)
+    {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Use mode=vless or mode=direct");
+    }
+    char body[33] = {0};
+    int  total    = 0;
+    while (total < req->content_len)
+    {
+        int received = httpd_req_recv(req, body + total, req->content_len - total);
+        if (received <= 0)
+        {
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Incomplete route form");
+        }
+        total += received;
+    }
+    char mode[12] = {0};
+    if (!form_value(body, "mode", mode, sizeof(mode)) ||
+        (strcmp(mode, "vless") != 0 && strcmp(mode, "direct") != 0))
+    {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Use mode=vless or mode=direct");
+    }
+    set_transparent_mode(strcmp(mode, "direct") == 0 ? TRANSPARENT_MODE_UPSTREAM
+                                                        : TRANSPARENT_MODE_VLESS);
+    ESP_LOGW(TAG, "Authenticated local route test selected %s for this boot", mode);
+    return send_json(req, transparent_mode_uses_vless()
+                              ? "{\"message\":\"VLESS route active for this boot.\"}"
+                              : "{\"message\":\"DIRECT route active for this boot; traffic bypasses VLESS.\"}");
+}
+
 static void json_string(httpd_req_t *req, const char *text)
 {
     httpd_resp_sendstr_chunk(req, "\"");
@@ -2944,7 +3034,7 @@ static void start_http_server(void)
     httpd_handle_t server   = NULL;
     httpd_config_t config   = HTTPD_DEFAULT_CONFIG();
     config.stack_size       = 8192;
-    config.max_uri_handlers = 14;
+    config.max_uri_handlers = 15;
     config.lru_purge_enable = true;
     config.uri_match_fn     = httpd_uri_match_wildcard;
     ESP_ERROR_CHECK(httpd_start(&server, &config));
@@ -2960,6 +3050,8 @@ static void start_http_server(void)
                                             .method   = HTTP_POST,
                                             .handler  = config_post,
                                             .user_ctx = (void *)CONFIG_SECTION_VLESS};
+    const httpd_uri_t route_post_uri     = {.uri = "/api/route", .method = HTTP_POST,
+                                             .handler = route_post};
     const httpd_uri_t ap_post            = {.uri      = "/api/access-point",
                                             .method   = HTTP_POST,
                                             .handler  = config_post,
@@ -2980,6 +3072,7 @@ static void start_http_server(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &upstream_post));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &upstream_delete));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &vless_post));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &route_post_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &ap_post));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &admin_password_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &vless_test));
@@ -3299,7 +3392,7 @@ static void serial_console_task(void *arg)
     (void)arg;
     char line[384];
     ESP_LOGI(TAG,
-             "Serial commands: help; status; wifi; ap; apip; vless; vless-uri; dns; mux; admin");
+             "Serial commands: help; status; diag; route; wifi; ap; apip; vless; vless-uri; dns; mux; admin");
     for (;;)
     {
         if (!fgets(line, sizeof(line), stdin))
@@ -3322,7 +3415,7 @@ static void serial_console_task(void *arg)
         }
         if (strcmp(command, "help") == 0)
         {
-            ESP_LOGI(TAG, "status; wifi <ssid> [password]; ap <ssid> <password>");
+            ESP_LOGI(TAG, "status; diag; route <vless|direct>; wifi <ssid> [password]; ap <ssid> <password>");
             ESP_LOGI(TAG, "apip <IPv4 ending in .1>");
             ESP_LOGI(TAG, "vless <host> <port> <uuid>; vless-uri <uri>; dns <host|clear>");
             ESP_LOGI(TAG, "mux <on|off>; admin <new-password>");
@@ -3337,6 +3430,25 @@ static void serial_console_task(void *arg)
                      configured_ap_ipv4(&s_config), s_config.upstream_ssid, transparent_mode_name(),
                      s_config.vless_host, s_config.vless_port, s_config.dns_resolver,
                      s_config.singmux_enabled ? "enabled" : "disabled");
+            continue;
+        }
+        if (strcmp(command, "diag") == 0)
+        {
+            serial_diagnostics();
+            continue;
+        }
+        if (strcmp(command, "route") == 0)
+        {
+            if (!first || second ||
+                (strcmp(first, "vless") != 0 && strcmp(first, "direct") != 0))
+            {
+                ESP_LOGW(TAG, "Usage: route <vless|direct>");
+                continue;
+            }
+            set_transparent_mode(strcmp(first, "vless") == 0 ? TRANSPARENT_MODE_VLESS
+                                                               : TRANSPARENT_MODE_UPSTREAM);
+            ESP_LOGW(TAG, "Route is %s for this boot; direct bypasses VLESS for TCP and UDP",
+                     transparent_mode_uses_vless() ? "VLESS" : "DIRECT");
             continue;
         }
         if (strcmp(command, "mux") == 0)
@@ -3671,6 +3783,9 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     apply_access_point_config();
     ESP_ERROR_CHECK(esp_wifi_start());
+    /* STA modem sleep adds latency and can throttle AP+STA forwarding.  A
+       mains/USB-powered router should prefer predictable forwarding latency. */
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     xTaskCreate(captive_dns_task, "captive_dns", 6144, NULL, 4, NULL);
     xTaskCreate(factory_reset_button_task, "factory_reset", 2048, NULL, 4, NULL);
     xTaskCreate(serial_console_task, "serial_console", 4096, NULL, 4, NULL);
