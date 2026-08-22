@@ -48,10 +48,11 @@
 #define UDP_RX_BUFFER_MAX (UDP_DATAGRAM_MAX * 4 + 512)
 /* Shared smux reassembly buffer; allocated from PSRAM. */
 #define SINGMUX_RX_BUFFER_MAX (128 * 1024)
+#define SINGMUX_SOCKET_READ_SIZE 4096
 #define UDP_QUEUE_SEND_WAIT_MS 2
 /* smux keeps transport sockets scarce.  TCP payloads themselves are allocated
    in PSRAM and only pointers travel through this small control queue. */
-#define SINGMUX_TCP_STREAM_MAX 60
+#define SINGMUX_TCP_STREAM_MAX 80
 #define SINGMUX_CONTROL_QUEUE_DEPTH 96
 #define SINGMUX_CONTROL_BATCH_MAX 8
 #define SINGMUX_TCP_RX_QUEUE_DEPTH 12
@@ -89,6 +90,29 @@ typedef struct
     uint32_t upload_bps;
     uint32_t download_bps;
 } bandwidth_stats_t;
+
+/* These are deliberately aggregate and lock-free: their purpose is to show
+ * persistent pressure/failures without perturbing the forwarding hot path. */
+typedef struct
+{
+    uint32_t sessions_opened;
+    uint32_t sessions_closed;
+    uint32_t close_eof;
+    uint32_t close_socket_error;
+    uint32_t close_protocol_error;
+    uint32_t tx_frames;
+    uint32_t rx_frames;
+    uint64_t tx_wire_bytes;
+    uint64_t rx_wire_bytes;
+    uint32_t tcp_rx_queue_full;
+    uint32_t tcp_rx_alloc_failures;
+    uint32_t tcp_control_queue_timeouts;
+    uint32_t tcp_stream_open_failures;
+    uint16_t tcp_rx_queue_high_water;
+    uint32_t last_session_open_ms;
+    uint32_t last_session_close_ms;
+    int      last_socket_errno;
+} singmux_stats_t;
 
 typedef struct
 {
@@ -146,9 +170,13 @@ static uint32_t             s_sample_time_ms;
 static int                  s_singmux_tunnel         = -1;
 static uint32_t             s_singmux_next_stream_id = 3;
 static uint8_t             *s_singmux_rx_buffer;
+/* Only the smux manager calls recv(), so this does not need per-task storage.
+ * Keeping it static avoids consuming most of that task's 6 KiB stack. */
+static uint8_t              s_singmux_socket_read_buffer[SINGMUX_SOCKET_READ_SIZE];
 static size_t               s_singmux_rx_length;
 static bool                 s_singmux_vless_response_pending;
 static singmux_tcp_stream_t s_singmux_tcp_streams[SINGMUX_TCP_STREAM_MAX];
+static singmux_stats_t      s_singmux_stats;
 static uint32_t             s_upload_bps;
 static uint32_t             s_download_bps;
 static volatile bool        s_transport_reset_requested;
@@ -165,6 +193,7 @@ static char                 s_boot_failed_upstream_ssid[33];
 
 static bool socket_send_all(int socket_fd, const uint8_t *data, size_t length);
 static bool socket_recv_all(int socket_fd, uint8_t *data, size_t length);
+static uint32_t now_ms(void);
 static bool dns_name(const uint8_t *packet, int bytes, int *offset, char name[254]);
 static void json_string(httpd_req_t *req, const char *text);
 static void apply_access_point_task(void *argument);
@@ -285,6 +314,20 @@ static void serial_diagnostics(void)
              SINGMUX_CONTROL_QUEUE_DEPTH,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    ESP_LOGI(TAG,
+             "DIAG smux: sessions open/closed=%u/%u EOF=%u socket=%u protocol=%u last_errno=%d "
+             "wire tx/rx=%llu/%llu frames=%u/%u; TCP rx queue high=%u/%u full=%u alloc_fail=%u "
+             "control_timeout=%u open_fail=%u",
+             (unsigned)s_singmux_stats.sessions_opened, (unsigned)s_singmux_stats.sessions_closed,
+             (unsigned)s_singmux_stats.close_eof, (unsigned)s_singmux_stats.close_socket_error,
+             (unsigned)s_singmux_stats.close_protocol_error, s_singmux_stats.last_socket_errno,
+             (unsigned long long)s_singmux_stats.tx_wire_bytes,
+             (unsigned long long)s_singmux_stats.rx_wire_bytes, (unsigned)s_singmux_stats.tx_frames,
+             (unsigned)s_singmux_stats.rx_frames, (unsigned)s_singmux_stats.tcp_rx_queue_high_water,
+             SINGMUX_TCP_RX_QUEUE_DEPTH, (unsigned)s_singmux_stats.tcp_rx_queue_full,
+             (unsigned)s_singmux_stats.tcp_rx_alloc_failures,
+             (unsigned)s_singmux_stats.tcp_control_queue_timeouts,
+             (unsigned)s_singmux_stats.tcp_stream_open_failures);
 }
 
 static bool access_point_ip_info(esp_netif_ip_info_t *info)
@@ -1029,6 +1072,12 @@ static esp_err_t config_get(httpd_req_t *req)
         "\"dns\":\"%s\",\"xudp_active\":%u,\"xudp_queued\":%u,\"xudp_dropped\":%u,"
         "\"xudp_rx_dropped\":%u,\"xudp_tunnel_failures\":%u,\"transparent_tcp_max\":%u,"
         "\"singmux_connected\":%s,\"singmux_tcp_active\":%u,\"singmux_control_queued\":%u,"
+        "\"singmux_sessions_opened\":%u,\"singmux_sessions_closed\":%u,"
+        "\"singmux_close_eof\":%u,\"singmux_close_socket_error\":%u,\"singmux_close_protocol_error\":%u,"
+        "\"singmux_last_errno\":%d,\"singmux_tx_wire_bytes\":%llu,\"singmux_rx_wire_bytes\":%llu,"
+        "\"singmux_tx_frames\":%u,\"singmux_rx_frames\":%u,\"singmux_tcp_rx_queue_high_water\":%u,"
+        "\"singmux_tcp_rx_queue_full\":%u,\"singmux_tcp_rx_alloc_failures\":%u,"
+        "\"singmux_control_timeouts\":%u,\"singmux_tcp_open_failures\":%u,"
         "\"up_bps\":%u,\"down_bps\":%u,\"up_bytes\":%llu,\"down_bytes\":%llu,"
         "\"free_internal\":%u,\"largest_internal_block\":%u,\"free_psram\":%u,"
         "\"free_total\":%u}",
@@ -1041,6 +1090,16 @@ static esp_err_t config_get(httpd_req_t *req)
         (unsigned)TRANSPARENT_TCP_MAX_FLOWS, s_singmux_tunnel >= 0 ? "true" : "false",
         (unsigned)singmux_tcp_active,
         s_singmux_control_queue ? (unsigned)uxQueueMessagesWaiting(s_singmux_control_queue) : 0,
+        (unsigned)s_singmux_stats.sessions_opened, (unsigned)s_singmux_stats.sessions_closed,
+        (unsigned)s_singmux_stats.close_eof, (unsigned)s_singmux_stats.close_socket_error,
+        (unsigned)s_singmux_stats.close_protocol_error, s_singmux_stats.last_socket_errno,
+        (unsigned long long)s_singmux_stats.tx_wire_bytes,
+        (unsigned long long)s_singmux_stats.rx_wire_bytes, (unsigned)s_singmux_stats.tx_frames,
+        (unsigned)s_singmux_stats.rx_frames, (unsigned)s_singmux_stats.tcp_rx_queue_high_water,
+        (unsigned)s_singmux_stats.tcp_rx_queue_full,
+        (unsigned)s_singmux_stats.tcp_rx_alloc_failures,
+        (unsigned)s_singmux_stats.tcp_control_queue_timeouts,
+        (unsigned)s_singmux_stats.tcp_stream_open_failures,
         (unsigned)bandwidth.upload_bps, (unsigned)bandwidth.download_bps,
         (unsigned long long)bandwidth.upload_bytes, (unsigned long long)bandwidth.download_bytes,
         (unsigned)free_internal, (unsigned)largest_internal_block, (unsigned)free_psram,
@@ -1132,6 +1191,8 @@ static int open_singmux_session(void)
        smux frame.
      * The manager strips it before parsing smux frames. */
     s_singmux_vless_response_pending = true;
+    s_singmux_stats.sessions_opened++;
+    s_singmux_stats.last_session_open_ms = now_ms();
     return socket_fd;
 }
 
@@ -1144,8 +1205,18 @@ static bool singmux_send_frame(int socket_fd, uint8_t command, uint32_t stream_i
     {
         return false;
     }
-    return socket_send_all(socket_fd, header, sizeof(header)) &&
-           (!payload_length || socket_send_all(socket_fd, payload, payload_length));
+    bool ok = socket_send_all(socket_fd, header, sizeof(header)) &&
+              (!payload_length || socket_send_all(socket_fd, payload, payload_length));
+    if (ok)
+    {
+        s_singmux_stats.tx_frames++;
+        s_singmux_stats.tx_wire_bytes += sizeof(header) + payload_length;
+    }
+    else
+    {
+        s_singmux_stats.last_socket_errno = errno;
+    }
+    return ok;
 }
 
 /* Opens a plain VLESS TCP request addressed by an already-resolved IPv4 address. */
@@ -1575,12 +1646,14 @@ static int singmux_tcp_open(uint32_t destination_ip, const char *destination_nam
     }
     if (xQueueSend(s_singmux_control_queue, &control, pdMS_TO_TICKS(1000)) != pdTRUE)
     {
+        s_singmux_stats.tcp_control_queue_timeouts++;
         free(first);
         return -1;
     }
     uint32_t answer = 0;
     if (xTaskNotifyWait(0, UINT32_MAX, &answer, pdMS_TO_TICKS(15000)) != pdTRUE || !answer)
     {
+        s_singmux_stats.tcp_stream_open_failures++;
         return -1;
     }
     return (int)answer - 1;
@@ -1606,6 +1679,7 @@ static bool singmux_tcp_queue_data(int slot, uint32_t stream_id, const uint8_t *
                                  .data      = copy};
     if (xQueueSend(s_singmux_control_queue, &control, pdMS_TO_TICKS(250)) != pdTRUE)
     {
+        s_singmux_stats.tcp_control_queue_timeouts++;
         free(copy);
         return false;
     }
@@ -1626,6 +1700,7 @@ static bool singmux_tcp_close(int slot, uint32_t stream_id)
                                  .reply_task = xTaskGetCurrentTaskHandle()};
     if (xQueueSend(s_singmux_control_queue, &control, pdMS_TO_TICKS(250)) != pdTRUE)
     {
+        s_singmux_stats.tcp_control_queue_timeouts++;
         return false;
     }
     uint32_t answer = 0;
@@ -1677,6 +1752,15 @@ static void relay_singmux_tcp_stream(int client, int slot)
             {
                 goto close_stream;
             }
+        }
+        /* A full queue can happen when this AP client cannot accept data
+         * quickly enough.  It must close only this stream, never the shared
+         * session carrying unrelated browser connections. */
+        if (s_singmux_tcp_streams[slot].peer_closed &&
+            uxQueueMessagesWaiting(receive_queue) == 0)
+        {
+            detached = singmux_tcp_close(slot, stream_id);
+            goto done;
         }
     }
 close_stream:
@@ -1872,6 +1956,7 @@ static uint32_t s_udp_last_backpressure_log_ms;
 static int      udp_association_find_singmux_stream(uint32_t stream_id);
 static int      singmux_tcp_stream_find(uint32_t stream_id);
 static bool     singmux_receive_available(void);
+static bool     singmux_socket_readable(void);
 
 static uint32_t now_ms(void)
 {
@@ -1947,14 +2032,23 @@ static bool singmux_tcp_deliver(int slot, const uint8_t *payload, size_t length)
         heap_caps_malloc(sizeof(*item) + length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!item)
     {
-        return false;
+        s_singmux_stats.tcp_rx_alloc_failures++;
+        stream->peer_closed = true;
+        return true;
     }
     item->length = length;
     memcpy(item->data, payload, length);
     if (xQueueSend(stream->receive_queue, &item, 0) != pdTRUE)
     {
         free(item);
-        return false;
+        s_singmux_stats.tcp_rx_queue_full++;
+        stream->peer_closed = true;
+        return true;
+    }
+    UBaseType_t depth = uxQueueMessagesWaiting(stream->receive_queue);
+    if (depth > s_singmux_stats.tcp_rx_queue_high_water)
+    {
+        s_singmux_stats.tcp_rx_queue_high_water = (uint16_t)depth;
     }
     bandwidth_record_download(length);
     return true;
@@ -2276,6 +2370,7 @@ static void singmux_process_control(void)
 static void transparent_udp_manager_task(void *arg)
 {
     (void)arg;
+    uint8_t smux_receive_burst = 0;
     for (;;)
     {
         if (s_transport_reset_requested)
@@ -2298,13 +2393,20 @@ static void transparent_udp_manager_task(void *arg)
         }
         bool use_vless = transparent_mode_uses_vless();
         singmux_process_control();
+        /* Do not add the normal ingress wait to an active TCP download.  More
+         * importantly, singmux_receive_available() parses one socket read at a
+         * time, so each pass frees reassembly space before accepting more. */
+        bool smux_receive_pending =
+            use_vless && s_config.singmux_enabled && s_singmux_tunnel >= 0 &&
+            singmux_socket_readable();
         /* Give control and UDP equal bounded service.  Draining all TCP controls first can
            indefinitely starve queued XUDP traffic when relay tasks remain busy. */
         for (size_t processed = 0; processed < UDP_MANAGER_BATCH_MAX; ++processed)
         {
             udp_ingress_t ingress;
             if (xQueueReceive(s_udp_manager_queue, &ingress,
-                              pdMS_TO_TICKS(processed == 0 ? 20 : 0)) != pdTRUE)
+                              pdMS_TO_TICKS(processed == 0 && !smux_receive_pending ? 20 : 0)) !=
+                pdTRUE)
             {
                 break;
             }
@@ -2477,8 +2579,15 @@ static void transparent_udp_manager_task(void *arg)
             if (use_vless && s_config.singmux_enabled && s_singmux_tunnel >= 0 &&
                 FD_ISSET(s_singmux_tunnel, &reads) && !singmux_receive_available())
             {
+                s_singmux_stats.sessions_closed++;
+                s_singmux_stats.last_session_close_ms = now_ms();
                 ESP_LOGW(TAG,
-                         "sing-box smux session closed; associations will reconnect on demand");
+                         "sing-box smux session closed (EOF=%u socket=%u protocol=%u errno=%d); "
+                         "associations will reconnect on demand",
+                         (unsigned)s_singmux_stats.close_eof,
+                         (unsigned)s_singmux_stats.close_socket_error,
+                         (unsigned)s_singmux_stats.close_protocol_error,
+                         s_singmux_stats.last_socket_errno);
                 close(s_singmux_tunnel);
                 s_singmux_tunnel    = -1;
                 s_singmux_rx_length = 0;
@@ -2519,6 +2628,22 @@ static void transparent_udp_manager_task(void *arg)
             {
                 udp_association_release(i);
             }
+        }
+        /* A continuously readable smux socket otherwise keeps this priority-5
+         * task runnable forever and starves same-priority HTTP/relay tasks.
+         * Four 4 KiB passes per tick preserves responsiveness without imposing
+         * a roughly 400 KiB/s ceiling on a sustained download. */
+        if (smux_receive_pending)
+        {
+            if (++smux_receive_burst >= 4)
+            {
+                smux_receive_burst = 0;
+                vTaskDelay(1);
+            }
+        }
+        else
+        {
+            smux_receive_burst = 0;
         }
     }
 }
@@ -3863,28 +3988,30 @@ static bool singmux_deliver_udp(udp_association_t *association, const uint8_t *p
 
 static bool singmux_receive_available(void)
 {
-    uint8_t received[1024];
-    for (;;)
+    int bytes = recv(s_singmux_tunnel, s_singmux_socket_read_buffer,
+                     sizeof(s_singmux_socket_read_buffer), MSG_DONTWAIT);
+    if (bytes > 0)
     {
-        int bytes = recv(s_singmux_tunnel, received, sizeof(received), MSG_DONTWAIT);
-        if (bytes > 0)
+        if ((size_t)bytes > SINGMUX_RX_BUFFER_MAX - s_singmux_rx_length)
         {
-            if ((size_t)bytes > SINGMUX_RX_BUFFER_MAX - s_singmux_rx_length)
-            {
-                return false;
-            }
-            memcpy(s_singmux_rx_buffer + s_singmux_rx_length, received, bytes);
-            s_singmux_rx_length += (size_t)bytes;
-            continue;
-        }
-        if (bytes == 0)
-        {
+            s_singmux_stats.close_protocol_error++;
+            ESP_LOGW(TAG, "smux reassembly buffer full (%u bytes)",
+                     (unsigned)s_singmux_rx_length);
             return false;
         }
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
-        {
-            break;
-        }
+        memcpy(s_singmux_rx_buffer + s_singmux_rx_length, s_singmux_socket_read_buffer, bytes);
+        s_singmux_rx_length += (size_t)bytes;
+        s_singmux_stats.rx_wire_bytes += (size_t)bytes;
+    }
+    else if (bytes == 0)
+    {
+        s_singmux_stats.close_eof++;
+        return false;
+    }
+    else if (errno != EAGAIN && errno != EWOULDBLOCK)
+    {
+        s_singmux_stats.close_socket_error++;
+        s_singmux_stats.last_socket_errno = errno;
         return false;
     }
     size_t consumed = 0;
@@ -3897,6 +4024,7 @@ static bool singmux_receive_available(void)
         size_t addon_length = s_singmux_rx_buffer[1];
         if (s_singmux_rx_buffer[0] != 0 || s_singmux_rx_length < addon_length + 2)
         {
+            s_singmux_stats.close_protocol_error++;
             return false;
         }
         consumed                         = addon_length + 2;
@@ -3910,6 +4038,7 @@ static bool singmux_receive_available(void)
         uint8_t *frame = s_singmux_rx_buffer + consumed;
         if (!singmux_decode_smux_header(frame, &command, &stream_id, &payload_length))
         {
+            s_singmux_stats.close_protocol_error++;
             return false;
         }
         if (s_singmux_rx_length - consumed < SMUX_HEADER_SIZE + payload_length)
@@ -3923,6 +4052,7 @@ static bool singmux_receive_available(void)
             if (command == SMUX_CMD_PSH &&
                 !singmux_deliver_udp(association, frame + SMUX_HEADER_SIZE, payload_length))
             {
+                s_singmux_stats.close_protocol_error++;
                 return false;
             }
             if (command == SMUX_CMD_FIN)
@@ -3938,6 +4068,7 @@ static bool singmux_receive_available(void)
                 if (command == SMUX_CMD_PSH &&
                     !singmux_tcp_deliver(tcp_slot, frame + SMUX_HEADER_SIZE, payload_length))
                 {
+                    s_singmux_stats.close_protocol_error++;
                     return false;
                 }
                 if (command == SMUX_CMD_FIN)
@@ -3946,6 +4077,7 @@ static bool singmux_receive_available(void)
                 }
             }
         }
+        s_singmux_stats.rx_frames++;
         consumed += SMUX_HEADER_SIZE + payload_length;
     }
     if (consumed)
@@ -3955,6 +4087,20 @@ static bool singmux_receive_available(void)
         s_singmux_rx_length -= consumed;
     }
     return true;
+}
+
+static bool singmux_socket_readable(void)
+{
+    if (s_singmux_tunnel < 0)
+    {
+        return false;
+    }
+    fd_set reads;
+    FD_ZERO(&reads);
+    FD_SET(s_singmux_tunnel, &reads);
+    struct timeval timeout = {.tv_sec = 0, .tv_usec = 0};
+    return select(s_singmux_tunnel + 1, &reads, NULL, NULL, &timeout) > 0 &&
+           FD_ISSET(s_singmux_tunnel, &reads);
 }
 
 void app_main(void)

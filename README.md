@@ -109,7 +109,10 @@ passwords or the VLESS UUID.
 For throughput diagnosis, start a speed test and enter `diag` twice about one
 second apart. It reports the payload upload/download rate, STA RSSI and channel,
 AP client count, TCP window/buffer configuration, UDP/smux queue pressure,
-dropped datagrams, and free internal/PSRAM. The firmware uses 32 KiB TCP
+dropped datagrams, free internal/PSRAM, smux wire bytes/frames, and smux close
+causes (EOF, socket error, or protocol error). A non-zero TCP receive-queue
+`full` counter means one downstream client stream was too slow; it is now
+closed independently rather than tearing down the shared smux session. The firmware uses 32 KiB TCP
 receive/send buffers, SACK, 32 Wi-Fi TX buffers, and disables STA modem sleep;
 the previous 5,760-byte TCP windows could limit a VLESS TCP stream to roughly
 1 Mbps at high RTT. Use `route direct` for a same-boot,
