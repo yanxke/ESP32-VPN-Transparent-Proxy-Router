@@ -4,15 +4,3 @@ CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_r8n8.csv"
 CONFIG_PARTITION_TABLE_FILENAME="partitions_r8n8.csv"
-# ESP32-S3 maximum fixed CPU clock; power management is disabled for router latency.
-CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
-# This is a forwarding appliance, not a source-level debug build. -O2 removes
-# substantial relay-path overhead compared with ESP-IDF's default -Og.
-CONFIG_COMPILER_OPTIMIZATION_PERF=y
-# Compile out Info-level logging. VLESS_TRAFFIC_LOGS is also off by default;
-# serial `diag` deliberately uses warning level and remains available.
-CONFIG_LOG_DEFAULT_LEVEL_WARN=y
-CONFIG_LOG_MAXIMUM_EQUALS_DEFAULT=y
-# Per-core runtime measurements used by the authenticated diagnostics UI.
-CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
-CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID=y
