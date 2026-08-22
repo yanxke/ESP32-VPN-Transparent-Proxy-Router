@@ -22,6 +22,22 @@ pio run -e esp32s3_r8n8 -t upload --upload-port COM3
 
 If COM3 is busy, do not repeatedly retry or reset devices. First close PlatformIO/VS Code serial monitors and any other program using the port, then retry. USB upload normally preserves NVS.
 
+## Linting and formatting
+
+The repository formatting rules are in `.clang-format`. Before submitting C/C++ changes, check the affected files with:
+
+```powershell
+clang-format --dry-run --Werror --style=file src/main.c
+```
+
+To fix reported formatting violations, run:
+
+```powershell
+clang-format -i --style=file src/main.c
+```
+
+Replace `src/main.c` with every affected `.c` or `.h` file, then rerun the dry-run command. Formatting-only edits should not change behavior; validate them with the normal PlatformIO build when practical.
+
 ## Serial monitoring and diagnostics
 
 Use 115200 baud. Open one monitor only:
