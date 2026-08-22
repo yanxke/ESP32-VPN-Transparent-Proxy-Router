@@ -12,6 +12,7 @@
 #include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_private/esp_clk.h"
 #include "esp_netif.h"
 #include "esp_netif_net_stack.h"
 #include "esp_ota_ops.h"
@@ -19,6 +20,7 @@
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "driver/gpio.h"
+#include "driver/temperature_sensor.h"
 #include "lwip/ip4_addr.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -185,6 +187,14 @@ static uint32_t             s_upload_bps_10s;
 static uint32_t             s_download_bps_10s;
 static uint32_t             s_upload_bps_30s;
 static uint32_t             s_download_bps_30s;
+static temperature_sensor_handle_t s_temperature_sensor;
+static bool                 s_temperature_sensor_ready;
+static float                s_chip_temperature_c;
+static uint8_t              s_cpu_load_core0;
+static uint8_t              s_cpu_load_core1;
+static uint16_t             s_cpu_frequency_mhz;
+static uint32_t             s_previous_idle_runtime[2];
+static uint64_t             s_cpu_sample_time_us;
 static int                  s_singmux_tunnel         = -1;
 static uint32_t             s_singmux_next_stream_id = 3;
 static uint8_t             *s_singmux_rx_buffer;
@@ -219,6 +229,70 @@ static void reset_transparent_transport_state(void);
 static void set_transparent_mode(transparent_mode_t mode);
 static void schedule_boot_upstream_scan(void);
 
+static void initialize_device_health_monitoring(void)
+{
+    s_cpu_frequency_mhz = (uint16_t)(esp_clk_cpu_freq() / 1000000U);
+    temperature_sensor_config_t config = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 80);
+    esp_err_t result = temperature_sensor_install(&config, &s_temperature_sensor);
+    if (result == ESP_OK)
+    {
+        result = temperature_sensor_enable(s_temperature_sensor);
+    }
+    if (result == ESP_OK)
+    {
+        s_temperature_sensor_ready = true;
+        ESP_LOGI(TAG, "on-die temperature monitoring enabled");
+    }
+    else
+    {
+        ESP_LOGW(TAG, "on-die temperature monitoring unavailable: %s", esp_err_to_name(result));
+        if (s_temperature_sensor)
+        {
+            temperature_sensor_uninstall(s_temperature_sensor);
+            s_temperature_sensor = NULL;
+        }
+    }
+}
+
+static void sample_device_health(void)
+{
+    float temperature_c = s_chip_temperature_c;
+    if (s_temperature_sensor_ready)
+    {
+        (void)temperature_sensor_get_celsius(s_temperature_sensor, &temperature_c);
+    }
+
+    uint64_t now_us = esp_timer_get_time();
+    uint32_t idle_runtime[2] = {
+        (uint32_t)ulTaskGetIdleRunTimeCounterForCore(0),
+        (uint32_t)ulTaskGetIdleRunTimeCounterForCore(1),
+    };
+    uint8_t cpu_load[2] = {s_cpu_load_core0, s_cpu_load_core1};
+    if (s_cpu_sample_time_us)
+    {
+        uint64_t elapsed_us = now_us - s_cpu_sample_time_us;
+        if (elapsed_us)
+        {
+            for (size_t core = 0; core < 2; ++core)
+            {
+                uint64_t idle_us = (uint32_t)(idle_runtime[core] - s_previous_idle_runtime[core]);
+                uint64_t busy_us = idle_us >= elapsed_us ? 0 : elapsed_us - idle_us;
+                uint64_t load = (busy_us * 100U) / elapsed_us;
+                cpu_load[core] = (uint8_t)(load > 100 ? 100 : load);
+            }
+        }
+    }
+    s_previous_idle_runtime[0] = idle_runtime[0];
+    s_previous_idle_runtime[1] = idle_runtime[1];
+    s_cpu_sample_time_us = now_us;
+
+    portENTER_CRITICAL(&s_bandwidth_lock);
+    s_chip_temperature_c = temperature_c;
+    s_cpu_load_core0 = cpu_load[0];
+    s_cpu_load_core1 = cpu_load[1];
+    portEXIT_CRITICAL(&s_bandwidth_lock);
+}
+
 static uint32_t bandwidth_window_bps(const uint32_t *history, uint8_t count,
                                      uint8_t next, uint8_t seconds)
 {
@@ -247,6 +321,7 @@ static void bandwidth_sampler_task(void *argument)
     for (;;)
     {
         vTaskDelayUntil(&wake_time, pdMS_TO_TICKS(1000));
+        sample_device_health();
         portENTER_CRITICAL(&s_bandwidth_lock);
         if (!initialized)
         {
@@ -373,7 +448,7 @@ static void serial_diagnostics(void)
         }
     }
 
-    ESP_LOGI(TAG,
+    ESP_LOGW(TAG,
              "DIAG route=%s upstream=%s Wi-Fi channel=%u secondary=%d AP-clients=%u; "
              "TCP wnd=32768 snd=32768 recvmbox=32; payload up=%u B/s down=%u B/s "
              "(%.2f/%.2f Mbps); rolling 10s up/down=%u/%u B/s, 30s=%u/%u B/s",
@@ -384,14 +459,14 @@ static void serial_diagnostics(void)
              bandwidth.download_bps_10s, bandwidth.upload_bps_30s, bandwidth.download_bps_30s);
     if (upstream_result == ESP_OK)
     {
-        ESP_LOGI(TAG, "DIAG uplink RSSI=%d dBm channel=%u auth=%d", upstream.rssi,
+        ESP_LOGW(TAG, "DIAG uplink RSSI=%d dBm channel=%u auth=%d", upstream.rssi,
                  upstream.primary, upstream.authmode);
     }
     else
     {
         ESP_LOGW(TAG, "DIAG uplink association unavailable: %s", esp_err_to_name(upstream_result));
     }
-    ESP_LOGI(TAG,
+    ESP_LOGW(TAG,
              "DIAG queues: UDP=%u/%u drops=%u rx_drops=%u tunnel_failures=%u; smux=%s "
              "TCP-streams=%u/%u control=%u/%u; heap internal=%u PSRAM=%u",
              s_udp_manager_queue ? (unsigned)uxQueueMessagesWaiting(s_udp_manager_queue) : 0,
@@ -402,7 +477,7 @@ static void serial_diagnostics(void)
              SINGMUX_CONTROL_QUEUE_DEPTH,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-    ESP_LOGI(TAG,
+    ESP_LOGW(TAG,
              "DIAG smux: sessions open/closed=%u/%u EOF=%u socket=%u protocol=%u last_errno=%d "
              "wire tx/rx=%llu/%llu frames=%u/%u; TCP rx queue high=%u/%u full=%u alloc_fail=%u "
              "control_timeout=%u open_fail=%u; reads=%u yields=%u reassembly_high=%u",
@@ -418,6 +493,9 @@ static void serial_diagnostics(void)
              (unsigned)s_singmux_stats.tcp_stream_open_failures,
              (unsigned)s_singmux_stats.rx_reads, (unsigned)s_singmux_stats.scheduler_yields,
              (unsigned)s_singmux_stats.rx_reassembly_high_water);
+    ESP_LOGW(TAG, "DIAG health: CPU=%u MHz chip=%.1f C core0=%u%% core1=%u%%",
+             (unsigned)s_cpu_frequency_mhz, s_chip_temperature_c, (unsigned)s_cpu_load_core0,
+             (unsigned)s_cpu_load_core1);
 }
 
 static bool access_point_ip_info(esp_netif_ip_info_t *info)
@@ -1171,7 +1249,9 @@ static esp_err_t config_get(httpd_req_t *req)
         "\"singmux_rx_reads\":%u,\"singmux_scheduler_yields\":%u,"
         "\"singmux_rx_reassembly_high_water\":%u,"
         "\"up_bps\":%u,\"down_bps\":%u,\"up_bps_10s\":%u,\"down_bps_10s\":%u,"
-        "\"up_bps_30s\":%u,\"down_bps_30s\":%u,\"up_bytes\":%llu,\"down_bytes\":%llu,"
+        "\"up_bps_30s\":%u,\"down_bps_30s\":%u,\"chip_temperature_c\":%.1f,"
+        "\"cpu_frequency_mhz\":%u,\"cpu_load_core0\":%u,\"cpu_load_core1\":%u,"
+        "\"up_bytes\":%llu,\"down_bytes\":%llu,"
         "\"free_internal\":%u,\"largest_internal_block\":%u,\"free_psram\":%u,"
         "\"free_total\":%u}",
         s_config.vless_host, s_config.vless_port, s_config.dns_resolver,
@@ -1198,6 +1278,8 @@ static esp_err_t config_get(httpd_req_t *req)
         (unsigned)bandwidth.upload_bps, (unsigned)bandwidth.download_bps,
         (unsigned)bandwidth.upload_bps_10s, (unsigned)bandwidth.download_bps_10s,
         (unsigned)bandwidth.upload_bps_30s, (unsigned)bandwidth.download_bps_30s,
+        s_chip_temperature_c, (unsigned)s_cpu_frequency_mhz, (unsigned)s_cpu_load_core0,
+        (unsigned)s_cpu_load_core1,
         (unsigned long long)bandwidth.upload_bytes, (unsigned long long)bandwidth.download_bytes,
         (unsigned)free_internal, (unsigned)largest_internal_block, (unsigned)free_psram,
         (unsigned)free_total);
@@ -4240,6 +4322,7 @@ void app_main(void)
     /* STA modem sleep adds latency and can throttle AP+STA forwarding.  A
        mains/USB-powered router should prefer predictable forwarding latency. */
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    initialize_device_health_monitoring();
     xTaskCreate(captive_dns_task, "captive_dns", 6144, NULL, 4, NULL);
     xTaskCreate(factory_reset_button_task, "factory_reset", 2048, NULL, 4, NULL);
     xTaskCreate(serial_console_task, "serial_console", 4096, NULL, 4, NULL);
