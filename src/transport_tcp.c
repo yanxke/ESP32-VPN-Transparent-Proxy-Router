@@ -23,6 +23,11 @@
 
 static const char *TAG = "transport_tcp";
 
+/* 1 KiB relay reads cause excessive task/socket scheduling on an AP+STA
+   router.  This stays comfortably below lwIP's MSS aggregation limits while
+   reducing copy and select overhead on sustained transfers. */
+#define TRANSPORT_RELAY_BUFFER_SIZE 4096
+
 bool transport_tcp_uuid_to_bytes(const char *uuid, uint8_t bytes[16])
 {
     int output = 0;
@@ -269,7 +274,7 @@ void transport_tcp_relay_vless(int client, int tunnel, const char *label,
         int  source       = tunnel_ready && (!client_ready || prefer_tunnel) ? tunnel : client;
         prefer_tunnel     = !prefer_tunnel;
         int     target    = source == client ? tunnel : client;
-        uint8_t buffer[1024];
+        uint8_t buffer[TRANSPORT_RELAY_BUFFER_SIZE];
         int     count = recv(source, buffer, sizeof(buffer), 0);
         if (count <= 0)
         {
@@ -351,7 +356,7 @@ void transport_tcp_relay_plain(int client, int upstream, const char *label,
         int  source = upstream_ready && (!client_ready || prefer_upstream) ? upstream : client;
         prefer_upstream = !prefer_upstream;
         int     target = source == client ? upstream : client;
-        uint8_t buffer[1024];
+        uint8_t buffer[TRANSPORT_RELAY_BUFFER_SIZE];
         int     count = recv(source, buffer, sizeof(buffer), 0);
         if (count <= 0)
         {

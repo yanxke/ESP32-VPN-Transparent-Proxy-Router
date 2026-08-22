@@ -12,12 +12,15 @@
 #include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_private/esp_clk.h"
 #include "esp_netif.h"
 #include "esp_netif_net_stack.h"
 #include "esp_ota_ops.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "driver/gpio.h"
+#include "driver/temperature_sensor.h"
 #include "lwip/ip4_addr.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -47,16 +50,18 @@
 #define UDP_RX_BUFFER_MAX (UDP_DATAGRAM_MAX * 4 + 512)
 /* Shared smux reassembly buffer; allocated from PSRAM. */
 #define SINGMUX_RX_BUFFER_MAX (128 * 1024)
+#define SINGMUX_SOCKET_READ_SIZE 4096
 #define UDP_QUEUE_SEND_WAIT_MS 2
 /* smux keeps transport sockets scarce.  TCP payloads themselves are allocated
    in PSRAM and only pointers travel through this small control queue. */
-#define SINGMUX_TCP_STREAM_MAX 60
+#define SINGMUX_TCP_STREAM_MAX 80
 #define SINGMUX_CONTROL_QUEUE_DEPTH 96
 #define SINGMUX_CONTROL_BATCH_MAX 8
-#define SINGMUX_TCP_RX_QUEUE_DEPTH 12
+#define SINGMUX_TCP_RX_QUEUE_DEPTH 24
 #define SINGMUX_TCP_DATA_MAX 2048
 #define UDP_MANAGER_BATCH_MAX 8
 #define OTA_UPLOAD_BUFFER_SIZE 1024
+#define BANDWIDTH_HISTORY_SECONDS 30
 
 /* Set -DVLESS_TRAFFIC_LOGS=1 in platformio.ini when packet-by-packet relay
    diagnostics are needed. It is off by default to keep the console usable. */
@@ -87,7 +92,37 @@ typedef struct
     uint64_t download_bytes;
     uint32_t upload_bps;
     uint32_t download_bps;
+    uint32_t upload_bps_10s;
+    uint32_t download_bps_10s;
+    uint32_t upload_bps_30s;
+    uint32_t download_bps_30s;
 } bandwidth_stats_t;
+
+/* These are deliberately aggregate and lock-free: their purpose is to show
+ * persistent pressure/failures without perturbing the forwarding hot path. */
+typedef struct
+{
+    uint32_t sessions_opened;
+    uint32_t sessions_closed;
+    uint32_t close_eof;
+    uint32_t close_socket_error;
+    uint32_t close_protocol_error;
+    uint32_t tx_frames;
+    uint32_t rx_frames;
+    uint64_t tx_wire_bytes;
+    uint64_t rx_wire_bytes;
+    uint32_t tcp_rx_queue_full;
+    uint32_t tcp_rx_alloc_failures;
+    uint32_t tcp_control_queue_timeouts;
+    uint32_t tcp_stream_open_failures;
+    uint16_t tcp_rx_queue_high_water;
+    uint32_t rx_reads;
+    uint32_t scheduler_yields;
+    uint32_t rx_reassembly_high_water;
+    uint32_t last_session_open_ms;
+    uint32_t last_session_close_ms;
+    int      last_socket_errno;
+} singmux_stats_t;
 
 typedef struct
 {
@@ -115,6 +150,7 @@ typedef struct
 {
     singmux_control_type_t type;
     int                    slot;
+    uint32_t               stream_id;
     TaskHandle_t           reply_task;
     uint32_t               destination_ip;
     uint16_t               destination_port;
@@ -122,31 +158,54 @@ typedef struct
     singmux_tcp_data_t    *data;
 } singmux_control_t;
 
-static router_config_t      s_config;
-static uint8_t              s_admin_password_hash[32];
-static bool                 s_has_upstream;
-static transparent_mode_t   s_transparent_mode = TRANSPARENT_MODE_VLESS;
-static esp_netif_t         *s_ap_netif;
-static esp_netif_t         *s_sta_netif;
-static int                  s_udp_relay_socket = -1;
-static QueueHandle_t        s_udp_manager_queue;
-static QueueHandle_t        s_singmux_control_queue;
-static uint32_t             s_udp_queue_drops;
-static uint32_t             s_udp_rx_drops;
-static uint32_t             s_udp_tunnel_failures;
-static volatile uint32_t    s_udp_active_associations;
-static portMUX_TYPE         s_bandwidth_lock = portMUX_INITIALIZER_UNLOCKED;
-static uint64_t             s_upload_bytes;
-static uint64_t             s_download_bytes;
-static uint64_t             s_sample_upload_bytes;
-static uint64_t             s_sample_download_bytes;
-static uint32_t             s_sample_time_ms;
-static int                  s_singmux_tunnel         = -1;
-static uint32_t             s_singmux_next_stream_id = 3;
-static uint8_t             *s_singmux_rx_buffer;
+static router_config_t    s_config;
+static uint8_t            s_admin_password_hash[32];
+static bool               s_has_upstream;
+static transparent_mode_t s_transparent_mode = TRANSPARENT_MODE_VLESS;
+static esp_netif_t       *s_ap_netif;
+static esp_netif_t       *s_sta_netif;
+static int                s_udp_relay_socket = -1;
+static QueueHandle_t      s_udp_manager_queue;
+static QueueHandle_t      s_singmux_control_queue;
+static uint32_t           s_udp_queue_drops;
+static uint32_t           s_udp_rx_drops;
+static uint32_t           s_udp_tunnel_failures;
+static volatile uint32_t  s_udp_active_associations;
+static portMUX_TYPE       s_bandwidth_lock = portMUX_INITIALIZER_UNLOCKED;
+static uint64_t           s_upload_bytes;
+static uint64_t           s_download_bytes;
+static uint64_t           s_sample_upload_bytes;
+static uint64_t           s_sample_download_bytes;
+static uint32_t           s_sample_time_ms;
+/* A sampler, rather than HTTP/serial polling, owns these time windows.  This
+ * lets us compare a
+ * transfer's opening seconds with its sustained rate. */
+static uint32_t                    s_upload_history[BANDWIDTH_HISTORY_SECONDS];
+static uint32_t                    s_download_history[BANDWIDTH_HISTORY_SECONDS];
+static uint8_t                     s_bandwidth_history_next;
+static uint8_t                     s_bandwidth_history_count;
+static uint32_t                    s_upload_bps_10s;
+static uint32_t                    s_download_bps_10s;
+static uint32_t                    s_upload_bps_30s;
+static uint32_t                    s_download_bps_30s;
+static temperature_sensor_handle_t s_temperature_sensor;
+static bool                        s_temperature_sensor_ready;
+static float                       s_chip_temperature_c;
+static uint8_t                     s_cpu_load_core0;
+static uint8_t                     s_cpu_load_core1;
+static uint16_t                    s_cpu_frequency_mhz;
+static uint32_t                    s_previous_idle_runtime[2];
+static uint64_t                    s_cpu_sample_time_us;
+static int                         s_singmux_tunnel         = -1;
+static uint32_t                    s_singmux_next_stream_id = 3;
+static uint8_t                    *s_singmux_rx_buffer;
+/* Only the smux manager calls recv(), so this does not need per-task storage.
+ * Keeping it static avoids consuming most of that task's 6 KiB stack. */
+static uint8_t              s_singmux_socket_read_buffer[SINGMUX_SOCKET_READ_SIZE];
 static size_t               s_singmux_rx_length;
 static bool                 s_singmux_vless_response_pending;
 static singmux_tcp_stream_t s_singmux_tcp_streams[SINGMUX_TCP_STREAM_MAX];
+static singmux_stats_t      s_singmux_stats;
 static uint32_t             s_upload_bps;
 static uint32_t             s_download_bps;
 static volatile bool        s_transport_reset_requested;
@@ -154,13 +213,149 @@ static bool                 s_configuration_mode;
 static wifi_ap_record_t     s_scan_records[20];
 static uint16_t             s_scan_record_count;
 static bool                 s_scan_results_available;
+/* The first configured upstream gets its normal connection attempt.  If that
+   fails during boot, scan once for a saved alternative instead of retrying the
+   same unavailable AP forever. */
+static bool s_boot_upstream_scan_scheduled;
+static bool s_boot_upstream_connected;
+static char s_boot_failed_upstream_ssid[33];
 
-static bool socket_send_all(int socket_fd, const uint8_t *data, size_t length);
-static bool socket_recv_all(int socket_fd, uint8_t *data, size_t length);
-static bool dns_name(const uint8_t *packet, int bytes, int *offset, char name[254]);
-static void json_string(httpd_req_t *req, const char *text);
-static void apply_access_point_task(void *argument);
-static void reset_transparent_transport_state(void);
+static bool     socket_send_all(int socket_fd, const uint8_t *data, size_t length);
+static bool     socket_recv_all(int socket_fd, uint8_t *data, size_t length);
+static uint32_t now_ms(void);
+static bool     dns_name(const uint8_t *packet, int bytes, int *offset, char name[254]);
+static void     json_string(httpd_req_t *req, const char *text);
+static void     apply_access_point_task(void *argument);
+static void     reset_transparent_transport_state(void);
+static void     set_transparent_mode(transparent_mode_t mode);
+static void     schedule_boot_upstream_scan(void);
+
+static void initialize_device_health_monitoring(void)
+{
+    s_cpu_frequency_mhz                = (uint16_t)(esp_clk_cpu_freq() / 1000000U);
+    temperature_sensor_config_t config = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 80);
+    esp_err_t                   result = temperature_sensor_install(&config, &s_temperature_sensor);
+    if (result == ESP_OK)
+    {
+        result = temperature_sensor_enable(s_temperature_sensor);
+    }
+    if (result == ESP_OK)
+    {
+        s_temperature_sensor_ready = true;
+        ESP_LOGI(TAG, "on-die temperature monitoring enabled");
+    }
+    else
+    {
+        ESP_LOGW(TAG, "on-die temperature monitoring unavailable: %s", esp_err_to_name(result));
+        if (s_temperature_sensor)
+        {
+            temperature_sensor_uninstall(s_temperature_sensor);
+            s_temperature_sensor = NULL;
+        }
+    }
+}
+
+static void sample_device_health(void)
+{
+    float temperature_c = s_chip_temperature_c;
+    if (s_temperature_sensor_ready)
+    {
+        (void)temperature_sensor_get_celsius(s_temperature_sensor, &temperature_c);
+    }
+
+    uint64_t now_us          = esp_timer_get_time();
+    uint32_t idle_runtime[2] = {
+        (uint32_t)ulTaskGetIdleRunTimeCounterForCore(0),
+        (uint32_t)ulTaskGetIdleRunTimeCounterForCore(1),
+    };
+    uint8_t cpu_load[2] = {s_cpu_load_core0, s_cpu_load_core1};
+    if (s_cpu_sample_time_us)
+    {
+        uint64_t elapsed_us = now_us - s_cpu_sample_time_us;
+        if (elapsed_us)
+        {
+            for (size_t core = 0; core < 2; ++core)
+            {
+                uint64_t idle_us = (uint32_t)(idle_runtime[core] - s_previous_idle_runtime[core]);
+                uint64_t busy_us = idle_us >= elapsed_us ? 0 : elapsed_us - idle_us;
+                uint64_t load    = (busy_us * 100U) / elapsed_us;
+                cpu_load[core]   = (uint8_t)(load > 100 ? 100 : load);
+            }
+        }
+    }
+    s_previous_idle_runtime[0] = idle_runtime[0];
+    s_previous_idle_runtime[1] = idle_runtime[1];
+    s_cpu_sample_time_us       = now_us;
+
+    portENTER_CRITICAL(&s_bandwidth_lock);
+    s_chip_temperature_c = temperature_c;
+    s_cpu_load_core0     = cpu_load[0];
+    s_cpu_load_core1     = cpu_load[1];
+    portEXIT_CRITICAL(&s_bandwidth_lock);
+}
+
+static uint32_t bandwidth_window_bps(const uint32_t *history, uint8_t count, uint8_t next,
+                                     uint8_t seconds)
+{
+    uint8_t window = count < seconds ? count : seconds;
+    if (!window)
+    {
+        return 0;
+    }
+    uint64_t total = 0;
+    for (uint8_t offset = 0; offset < window; ++offset)
+    {
+        uint8_t index =
+            (uint8_t)((next + BANDWIDTH_HISTORY_SECONDS - 1 - offset) % BANDWIDTH_HISTORY_SECONDS);
+        total += history[index];
+    }
+    return (uint32_t)(total / window);
+}
+
+static void bandwidth_sampler_task(void *argument)
+{
+    (void)argument;
+    uint64_t   previous_upload   = 0;
+    uint64_t   previous_download = 0;
+    bool       initialized       = false;
+    TickType_t wake_time         = xTaskGetTickCount();
+    for (;;)
+    {
+        vTaskDelayUntil(&wake_time, pdMS_TO_TICKS(1000));
+        sample_device_health();
+        portENTER_CRITICAL(&s_bandwidth_lock);
+        if (!initialized)
+        {
+            previous_upload   = s_upload_bytes;
+            previous_download = s_download_bytes;
+            initialized       = true;
+        }
+        else
+        {
+            s_upload_history[s_bandwidth_history_next] =
+                (uint32_t)(s_upload_bytes - previous_upload);
+            s_download_history[s_bandwidth_history_next] =
+                (uint32_t)(s_download_bytes - previous_download);
+            previous_upload   = s_upload_bytes;
+            previous_download = s_download_bytes;
+            s_bandwidth_history_next =
+                (uint8_t)((s_bandwidth_history_next + 1) % BANDWIDTH_HISTORY_SECONDS);
+            if (s_bandwidth_history_count < BANDWIDTH_HISTORY_SECONDS)
+            {
+                ++s_bandwidth_history_count;
+            }
+            s_upload_bps_10s   = bandwidth_window_bps(s_upload_history, s_bandwidth_history_count,
+                                                      s_bandwidth_history_next, 10);
+            s_download_bps_10s = bandwidth_window_bps(s_download_history, s_bandwidth_history_count,
+                                                      s_bandwidth_history_next, 10);
+            s_upload_bps_30s   = bandwidth_window_bps(s_upload_history, s_bandwidth_history_count,
+                                                      s_bandwidth_history_next, 30);
+            s_download_bps_30s = bandwidth_window_bps(s_download_history, s_bandwidth_history_count,
+                                                      s_bandwidth_history_next, 30);
+        }
+        portEXIT_CRITICAL(&s_bandwidth_lock);
+    }
+}
 
 static bool text_changed(const char *left, const char *right)
 {
@@ -221,9 +416,82 @@ static bandwidth_stats_t bandwidth_snapshot(void)
         s_sample_upload_bytes   = s_upload_bytes;
         s_sample_download_bytes = s_download_bytes;
     }
-    stats = (bandwidth_stats_t){s_upload_bytes, s_download_bytes, s_upload_bps, s_download_bps};
+    stats = (bandwidth_stats_t){s_upload_bytes,   s_download_bytes,  s_upload_bps,
+                                s_download_bps,   s_upload_bps_10s,  s_download_bps_10s,
+                                s_upload_bps_30s, s_download_bps_30s};
     portEXIT_CRITICAL(&s_bandwidth_lock);
     return stats;
+}
+
+/* Safe to call while a speed test is running.  It reports aggregate payload
+   flow without enabling the high-volume packet logging switch. */
+static void serial_diagnostics(void)
+{
+    bandwidth_stats_t  bandwidth          = bandwidth_snapshot();
+    wifi_ap_record_t   upstream           = {0};
+    uint8_t            primary            = 0;
+    wifi_second_chan_t secondary          = WIFI_SECOND_CHAN_NONE;
+    wifi_sta_list_t    clients            = {0};
+    esp_err_t          upstream_result    = esp_wifi_sta_get_ap_info(&upstream);
+    esp_err_t          client_result      = esp_wifi_ap_get_sta_list(&clients);
+    uint32_t           singmux_tcp_active = 0;
+    (void)esp_wifi_get_channel(&primary, &secondary);
+    for (size_t index = 0; index < SINGMUX_TCP_STREAM_MAX; ++index)
+    {
+        if (s_singmux_tcp_streams[index].in_use)
+        {
+            ++singmux_tcp_active;
+        }
+    }
+
+    ESP_LOGW(TAG,
+             "DIAG route=%s upstream=%s Wi-Fi channel=%u secondary=%d AP-clients=%u; "
+             "TCP wnd=32768 snd=32768 recvmbox=32; payload up=%u B/s down=%u B/s "
+             "(%.2f/%.2f Mbps); rolling 10s up/down=%u/%u B/s, 30s=%u/%u B/s",
+             transparent_mode_name(), s_has_upstream ? "up" : "down", primary, (int)secondary,
+             client_result == ESP_OK ? clients.num : 0, bandwidth.upload_bps,
+             bandwidth.download_bps, bandwidth.upload_bps * 8.0 / 1000000.0,
+             bandwidth.download_bps * 8.0 / 1000000.0, bandwidth.upload_bps_10s,
+             bandwidth.download_bps_10s, bandwidth.upload_bps_30s, bandwidth.download_bps_30s);
+    if (upstream_result == ESP_OK)
+    {
+        ESP_LOGW(TAG, "DIAG uplink RSSI=%d dBm channel=%u auth=%d", upstream.rssi, upstream.primary,
+                 upstream.authmode);
+    }
+    else
+    {
+        ESP_LOGW(TAG, "DIAG uplink association unavailable: %s", esp_err_to_name(upstream_result));
+    }
+    ESP_LOGW(TAG,
+             "DIAG queues: UDP=%u/%u drops=%u rx_drops=%u tunnel_failures=%u; smux=%s "
+             "TCP-streams=%u/%u control=%u/%u; heap internal=%u PSRAM=%u",
+             s_udp_manager_queue ? (unsigned)uxQueueMessagesWaiting(s_udp_manager_queue) : 0,
+             UDP_MANAGER_QUEUE_DEPTH, (unsigned)s_udp_queue_drops, (unsigned)s_udp_rx_drops,
+             (unsigned)s_udp_tunnel_failures, s_singmux_tunnel >= 0 ? "connected" : "off",
+             (unsigned)singmux_tcp_active, SINGMUX_TCP_STREAM_MAX,
+             s_singmux_control_queue ? (unsigned)uxQueueMessagesWaiting(s_singmux_control_queue)
+                                     : 0,
+             SINGMUX_CONTROL_QUEUE_DEPTH, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    ESP_LOGW(TAG,
+             "DIAG smux: sessions open/closed=%u/%u EOF=%u socket=%u protocol=%u last_errno=%d "
+             "wire tx/rx=%llu/%llu frames=%u/%u; TCP rx queue high=%u/%u full=%u alloc_fail=%u "
+             "control_timeout=%u open_fail=%u; reads=%u yields=%u reassembly_high=%u",
+             (unsigned)s_singmux_stats.sessions_opened, (unsigned)s_singmux_stats.sessions_closed,
+             (unsigned)s_singmux_stats.close_eof, (unsigned)s_singmux_stats.close_socket_error,
+             (unsigned)s_singmux_stats.close_protocol_error, s_singmux_stats.last_socket_errno,
+             (unsigned long long)s_singmux_stats.tx_wire_bytes,
+             (unsigned long long)s_singmux_stats.rx_wire_bytes, (unsigned)s_singmux_stats.tx_frames,
+             (unsigned)s_singmux_stats.rx_frames, (unsigned)s_singmux_stats.tcp_rx_queue_high_water,
+             SINGMUX_TCP_RX_QUEUE_DEPTH, (unsigned)s_singmux_stats.tcp_rx_queue_full,
+             (unsigned)s_singmux_stats.tcp_rx_alloc_failures,
+             (unsigned)s_singmux_stats.tcp_control_queue_timeouts,
+             (unsigned)s_singmux_stats.tcp_stream_open_failures, (unsigned)s_singmux_stats.rx_reads,
+             (unsigned)s_singmux_stats.scheduler_yields,
+             (unsigned)s_singmux_stats.rx_reassembly_high_water);
+    ESP_LOGW(TAG, "DIAG health: CPU=%u MHz chip=%.1f C core0=%u%% core1=%u%%",
+             (unsigned)s_cpu_frequency_mhz, s_chip_temperature_c, (unsigned)s_cpu_load_core0,
+             (unsigned)s_cpu_load_core1);
 }
 
 static bool access_point_ip_info(esp_netif_ip_info_t *info)
@@ -319,6 +587,123 @@ static void connect_upstream(void)
              s_config.upstream_password, s_config.upstream_password[0] ? "" : " (open network)");
 }
 
+/* Runs outside the Wi-Fi event loop because esp_wifi_scan_start(..., true)
+   blocks until the scan is complete.  Scan all reported APs: limiting the
+   result to the web UI's 20 entries could otherwise miss a weaker, but saved,
+   upstream. */
+static void boot_upstream_scan_task(void *argument)
+{
+    (void)argument;
+    vTaskDelay(pdMS_TO_TICKS(250));
+
+    wifi_scan_config_t scan = {
+        .show_hidden      = false,
+        .scan_type        = WIFI_SCAN_TYPE_ACTIVE,
+        .scan_time.active = {.min = 100, .max = 300},
+    };
+    ESP_LOGI(TAG, "Boot upstream recovery: scanning for saved Wi-Fi networks");
+    esp_err_t err = esp_wifi_scan_start(&scan, true);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "Boot upstream recovery scan failed: %s", esp_err_to_name(err));
+        vTaskDelete(NULL);
+        return;
+    }
+
+    uint16_t count = 0;
+    err            = esp_wifi_scan_get_ap_num(&count);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "Could not read boot scan results: %s", esp_err_to_name(err));
+        vTaskDelete(NULL);
+        return;
+    }
+    wifi_ap_record_t *records = count ? calloc(count, sizeof(*records)) : NULL;
+    if (count && !records)
+    {
+        ESP_LOGW(TAG, "Not enough memory to process %u boot scan results", (unsigned)count);
+        vTaskDelete(NULL);
+        return;
+    }
+    if (count)
+    {
+        err = esp_wifi_scan_get_ap_records(&count, records);
+        if (err != ESP_OK)
+        {
+            ESP_LOGW(TAG, "Could not retrieve boot scan results: %s", esp_err_to_name(err));
+            free(records);
+            vTaskDelete(NULL);
+            return;
+        }
+    }
+
+    int best_profile             = -1;
+    int best_rssi                = -127;
+    int best_alternative_profile = -1;
+    int best_alternative_rssi    = -127;
+    for (uint16_t record = 0; record < count; ++record)
+    {
+        for (uint8_t profile = 0;
+             profile < s_config.upstream_network_count && profile < UPSTREAM_NETWORK_MAX; ++profile)
+        {
+            if (strcmp((const char *)records[record].ssid,
+                       s_config.upstream_networks[profile].ssid) != 0)
+            {
+                continue;
+            }
+            if (best_profile < 0 || records[record].rssi > best_rssi)
+            {
+                best_profile = profile;
+                best_rssi    = records[record].rssi;
+            }
+            if (strcmp(s_config.upstream_networks[profile].ssid, s_boot_failed_upstream_ssid) !=
+                    0 &&
+                (best_alternative_profile < 0 || records[record].rssi > best_alternative_rssi))
+            {
+                best_alternative_profile = profile;
+                best_alternative_rssi    = records[record].rssi;
+            }
+        }
+    }
+    free(records);
+
+    /* Do not immediately retry a profile which already failed at boot when a
+       different saved AP is available. */
+    if (best_alternative_profile >= 0)
+    {
+        best_profile = best_alternative_profile;
+        best_rssi    = best_alternative_rssi;
+    }
+    if (best_profile < 0)
+    {
+        ESP_LOGW(TAG, "Boot upstream recovery: no saved upstream was found in %u AP(s)",
+                 (unsigned)count);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    const upstream_network_t *selected = &s_config.upstream_networks[best_profile];
+    strlcpy(s_config.upstream_ssid, selected->ssid, sizeof(s_config.upstream_ssid));
+    strlcpy(s_config.upstream_password, selected->password, sizeof(s_config.upstream_password));
+    ESP_LOGI(TAG, "Boot upstream recovery: selected saved AP '%s' (%d dBm)", s_config.upstream_ssid,
+             best_rssi);
+    connect_upstream();
+    vTaskDelete(NULL);
+}
+
+static void schedule_boot_upstream_scan(void)
+{
+    if (s_boot_upstream_scan_scheduled || s_configuration_mode)
+    {
+        return;
+    }
+    s_boot_upstream_scan_scheduled = true;
+    if (xTaskCreate(boot_upstream_scan_task, "boot_wifi_scan", 4096, NULL, 4, NULL) != pdPASS)
+    {
+        ESP_LOGW(TAG, "Could not start boot upstream recovery scan task");
+    }
+}
+
 static const char *wifi_disconnect_reason_text(uint8_t reason)
 {
     switch (reason)
@@ -350,14 +735,22 @@ static void network_event(void *arg, esp_event_base_t base, int32_t event, void 
     }
     if (base == WIFI_EVENT && event == WIFI_EVENT_STA_START)
     {
-        connect_upstream();
+        if (s_config.upstream_ssid[0])
+        {
+            connect_upstream();
+        }
+        else
+        {
+            /* This still scans on a first boot with no profiles, making the
+               available networks discoverable in the boot log. */
+            schedule_boot_upstream_scan();
+        }
     }
     if (base == WIFI_EVENT && event == WIFI_EVENT_STA_DISCONNECTED && s_config.upstream_ssid[0])
     {
         const wifi_event_sta_disconnected_t *disconnected = data;
-        ESP_LOGW(TAG, "Upstream '%s' disconnected: %s (reason=%u); retrying",
-                 s_config.upstream_ssid, wifi_disconnect_reason_text(disconnected->reason),
-                 (unsigned)disconnected->reason);
+        ESP_LOGW(TAG, "Upstream '%s' disconnected: %s (reason=%u)", s_config.upstream_ssid,
+                 wifi_disconnect_reason_text(disconnected->reason), (unsigned)disconnected->reason);
         s_has_upstream = false;
         reset_transparent_transport_state();
         refresh_transparent_interception_state();
@@ -367,7 +760,15 @@ static void network_event(void *arg, esp_event_base_t base, int32_t event, void 
             return;
         }
         status_led_show_mode(s_transparent_mode, s_has_upstream);
-        esp_wifi_connect();
+        if (s_boot_upstream_connected)
+        {
+            ESP_LOGI(TAG, "Retrying established upstream connection");
+            esp_wifi_connect();
+            return;
+        }
+        strlcpy(s_boot_failed_upstream_ssid, s_config.upstream_ssid,
+                sizeof(s_boot_failed_upstream_ssid));
+        schedule_boot_upstream_scan();
     }
     if (base == IP_EVENT && event == IP_EVENT_STA_GOT_IP)
     {
@@ -380,7 +781,8 @@ static void network_event(void *arg, esp_event_base_t base, int32_t event, void 
             esp_wifi_disconnect();
             return;
         }
-        s_has_upstream = true;
+        s_has_upstream            = true;
+        s_boot_upstream_connected = true;
         refresh_transparent_interception_state();
         status_led_show_mode(s_transparent_mode, s_has_upstream);
         ESP_LOGI(TAG, "Upstream '%s' connected with IP %s; %s", s_config.upstream_ssid, ip,
@@ -740,7 +1142,7 @@ static esp_err_t root_get(httpd_req_t *req)
     {
         return ESP_FAIL;
     }
-    httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return httpd_resp_send(req, portal_page_html(), HTTPD_RESP_USE_STRLEN);
 }
@@ -771,6 +1173,10 @@ static esp_err_t config_get(httpd_req_t *req)
     }
     bandwidth_stats_t bandwidth          = bandwidth_snapshot();
     uint32_t          singmux_tcp_active = 0;
+    uint32_t          free_internal      = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    uint32_t largest_internal_block      = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    uint32_t free_psram                  = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    uint32_t free_total                  = esp_get_free_heap_size();
     for (size_t index = 0; index < SINGMUX_TCP_STREAM_MAX; ++index)
     {
         if (s_singmux_tcp_streams[index].in_use)
@@ -829,7 +1235,21 @@ static esp_err_t config_get(httpd_req_t *req)
         "\"dns\":\"%s\",\"xudp_active\":%u,\"xudp_queued\":%u,\"xudp_dropped\":%u,"
         "\"xudp_rx_dropped\":%u,\"xudp_tunnel_failures\":%u,\"transparent_tcp_max\":%u,"
         "\"singmux_connected\":%s,\"singmux_tcp_active\":%u,\"singmux_control_queued\":%u,"
-        "\"up_bps\":%u,\"down_bps\":%u,\"up_bytes\":%llu,\"down_bytes\":%llu}",
+        "\"singmux_sessions_opened\":%u,\"singmux_sessions_closed\":%u,"
+        "\"singmux_close_eof\":%u,\"singmux_close_socket_error\":%u,\"singmux_close_protocol_"
+        "error\":%u,"
+        "\"singmux_last_errno\":%d,\"singmux_tx_wire_bytes\":%llu,\"singmux_rx_wire_bytes\":%llu,"
+        "\"singmux_tx_frames\":%u,\"singmux_rx_frames\":%u,\"singmux_tcp_rx_queue_high_water\":%u,"
+        "\"singmux_tcp_rx_queue_full\":%u,\"singmux_tcp_rx_alloc_failures\":%u,"
+        "\"singmux_control_timeouts\":%u,\"singmux_tcp_open_failures\":%u,"
+        "\"singmux_rx_reads\":%u,\"singmux_scheduler_yields\":%u,"
+        "\"singmux_rx_reassembly_high_water\":%u,"
+        "\"up_bps\":%u,\"down_bps\":%u,\"up_bps_10s\":%u,\"down_bps_10s\":%u,"
+        "\"up_bps_30s\":%u,\"down_bps_30s\":%u,\"chip_temperature_c\":%.1f,"
+        "\"cpu_frequency_mhz\":%u,\"cpu_load_core0\":%u,\"cpu_load_core1\":%u,"
+        "\"up_bytes\":%llu,\"down_bytes\":%llu,"
+        "\"free_internal\":%u,\"largest_internal_block\":%u,\"free_psram\":%u,"
+        "\"free_total\":%u}",
         s_config.vless_host, s_config.vless_port, s_config.dns_resolver,
         s_config.singmux_enabled ? "true" : "false", transparent_mode_name(),
         s_has_upstream ? "true" : "false", ip, gateway, netmask, dns_server,
@@ -839,8 +1259,25 @@ static esp_err_t config_get(httpd_req_t *req)
         (unsigned)TRANSPARENT_TCP_MAX_FLOWS, s_singmux_tunnel >= 0 ? "true" : "false",
         (unsigned)singmux_tcp_active,
         s_singmux_control_queue ? (unsigned)uxQueueMessagesWaiting(s_singmux_control_queue) : 0,
-        (unsigned)bandwidth.upload_bps, (unsigned)bandwidth.download_bps,
-        (unsigned long long)bandwidth.upload_bytes, (unsigned long long)bandwidth.download_bytes);
+        (unsigned)s_singmux_stats.sessions_opened, (unsigned)s_singmux_stats.sessions_closed,
+        (unsigned)s_singmux_stats.close_eof, (unsigned)s_singmux_stats.close_socket_error,
+        (unsigned)s_singmux_stats.close_protocol_error, s_singmux_stats.last_socket_errno,
+        (unsigned long long)s_singmux_stats.tx_wire_bytes,
+        (unsigned long long)s_singmux_stats.rx_wire_bytes, (unsigned)s_singmux_stats.tx_frames,
+        (unsigned)s_singmux_stats.rx_frames, (unsigned)s_singmux_stats.tcp_rx_queue_high_water,
+        (unsigned)s_singmux_stats.tcp_rx_queue_full,
+        (unsigned)s_singmux_stats.tcp_rx_alloc_failures,
+        (unsigned)s_singmux_stats.tcp_control_queue_timeouts,
+        (unsigned)s_singmux_stats.tcp_stream_open_failures, (unsigned)s_singmux_stats.rx_reads,
+        (unsigned)s_singmux_stats.scheduler_yields,
+        (unsigned)s_singmux_stats.rx_reassembly_high_water, (unsigned)bandwidth.upload_bps,
+        (unsigned)bandwidth.download_bps, (unsigned)bandwidth.upload_bps_10s,
+        (unsigned)bandwidth.download_bps_10s, (unsigned)bandwidth.upload_bps_30s,
+        (unsigned)bandwidth.download_bps_30s, s_chip_temperature_c, (unsigned)s_cpu_frequency_mhz,
+        (unsigned)s_cpu_load_core0, (unsigned)s_cpu_load_core1,
+        (unsigned long long)bandwidth.upload_bytes, (unsigned long long)bandwidth.download_bytes,
+        (unsigned)free_internal, (unsigned)largest_internal_block, (unsigned)free_psram,
+        (unsigned)free_total);
     httpd_resp_sendstr_chunk(req, chunk);
     return httpd_resp_sendstr_chunk(req, NULL);
 }
@@ -928,6 +1365,8 @@ static int open_singmux_session(void)
        smux frame.
      * The manager strips it before parsing smux frames. */
     s_singmux_vless_response_pending = true;
+    s_singmux_stats.sessions_opened++;
+    s_singmux_stats.last_session_open_ms = now_ms();
     return socket_fd;
 }
 
@@ -940,8 +1379,18 @@ static bool singmux_send_frame(int socket_fd, uint8_t command, uint32_t stream_i
     {
         return false;
     }
-    return socket_send_all(socket_fd, header, sizeof(header)) &&
-           (!payload_length || socket_send_all(socket_fd, payload, payload_length));
+    bool ok = socket_send_all(socket_fd, header, sizeof(header)) &&
+              (!payload_length || socket_send_all(socket_fd, payload, payload_length));
+    if (ok)
+    {
+        s_singmux_stats.tx_frames++;
+        s_singmux_stats.tx_wire_bytes += sizeof(header) + payload_length;
+    }
+    else
+    {
+        s_singmux_stats.last_socket_errno = errno;
+    }
+    return ok;
 }
 
 /* Opens a plain VLESS TCP request addressed by an already-resolved IPv4 address. */
@@ -1252,7 +1701,7 @@ static BaseType_t create_stream_task(TaskFunction_t task, const char *name, void
 {
     /* Wi-Fi and lwIP need internal RAM.  Relay task stacks can safely live in
        PSRAM, so connection capacity is not constrained by that scarce heap. */
-    return xTaskCreateWithCaps(task, name, 6144, argument, 5, NULL,
+    return xTaskCreateWithCaps(task, name, 8192, argument, 5, NULL,
                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 }
 
@@ -1371,18 +1820,20 @@ static int singmux_tcp_open(uint32_t destination_ip, const char *destination_nam
     }
     if (xQueueSend(s_singmux_control_queue, &control, pdMS_TO_TICKS(1000)) != pdTRUE)
     {
+        s_singmux_stats.tcp_control_queue_timeouts++;
         free(first);
         return -1;
     }
     uint32_t answer = 0;
     if (xTaskNotifyWait(0, UINT32_MAX, &answer, pdMS_TO_TICKS(15000)) != pdTRUE || !answer)
     {
+        s_singmux_stats.tcp_stream_open_failures++;
         return -1;
     }
     return (int)answer - 1;
 }
 
-static bool singmux_tcp_queue_data(int slot, const uint8_t *data, size_t length)
+static bool singmux_tcp_queue_data(int slot, uint32_t stream_id, const uint8_t *data, size_t length)
 {
     if (slot < 0 || length > SINGMUX_TCP_DATA_MAX || !s_singmux_control_queue)
     {
@@ -1396,65 +1847,111 @@ static bool singmux_tcp_queue_data(int slot, const uint8_t *data, size_t length)
     }
     copy->length = length;
     memcpy(copy->data, data, length);
-    singmux_control_t control = {.type = SINGMUX_CONTROL_DATA, .slot = slot, .data = copy};
+    singmux_control_t control = {
+        .type = SINGMUX_CONTROL_DATA, .slot = slot, .stream_id = stream_id, .data = copy};
     if (xQueueSend(s_singmux_control_queue, &control, pdMS_TO_TICKS(250)) != pdTRUE)
     {
+        s_singmux_stats.tcp_control_queue_timeouts++;
         free(copy);
         return false;
     }
     return true;
 }
 
-static void singmux_tcp_close(int slot)
+/* A close is acknowledged only after the manager has detached the stream.
+ * This lets the relay, which owns the queue allocation, delete it safely. */
+static bool singmux_tcp_close(int slot, uint32_t stream_id)
 {
-    if (!s_singmux_control_queue)
+    if (!s_singmux_control_queue || slot < 0)
     {
-        return;
+        return false;
     }
-    singmux_control_t control = {.type = SINGMUX_CONTROL_CLOSE, .slot = slot};
-    (void)xQueueSend(s_singmux_control_queue, &control, pdMS_TO_TICKS(250));
+    singmux_control_t control = {.type       = SINGMUX_CONTROL_CLOSE,
+                                 .slot       = slot,
+                                 .stream_id  = stream_id,
+                                 .reply_task = xTaskGetCurrentTaskHandle()};
+    if (xQueueSend(s_singmux_control_queue, &control, pdMS_TO_TICKS(250)) != pdTRUE)
+    {
+        s_singmux_stats.tcp_control_queue_timeouts++;
+        return false;
+    }
+    uint32_t answer = 0;
+    return xTaskNotifyWait(0, UINT32_MAX, &answer, pdMS_TO_TICKS(1000)) == pdTRUE && answer;
 }
 
 static void relay_singmux_tcp_stream(int client, int slot)
 {
+    if (slot < 0 || slot >= SINGMUX_TCP_STREAM_MAX)
+    {
+        return;
+    }
+    /* The manager does not delete this queue after a successful open.  Take a
+     * private handle before relaying so a detached slot can be reused safely. */
+    QueueHandle_t receive_queue = s_singmux_tcp_streams[slot].receive_queue;
+    uint32_t      stream_id     = s_singmux_tcp_streams[slot].stream_id;
+    if (!receive_queue || !stream_id)
+    {
+        return;
+    }
+    bool detached = false;
     for (;;)
     {
         fd_set reads;
         FD_ZERO(&reads);
         FD_SET(client, &reads);
-        struct timeval timeout = {.tv_sec = 0, .tv_usec = 20000};
-        int            ready   = select(client + 1, &reads, NULL, NULL, &timeout);
+        /* When downstream data is already queued, drain it immediately rather
+         * than
+         * waiting a full 20 ms for client input.  The latter let a fast
+         * smux download
+         * fill a 12-frame queue and terminate that stream. */
+        bool           have_downstream = uxQueueMessagesWaiting(receive_queue) != 0;
+        struct timeval timeout         = {.tv_sec = 0, .tv_usec = have_downstream ? 0 : 20000};
+        int            ready           = select(client + 1, &reads, NULL, NULL, &timeout);
         if (ready > 0 && FD_ISSET(client, &reads))
         {
             uint8_t buffer[1024];
             int     count = recv(client, buffer, sizeof(buffer), 0);
-            if (count <= 0 || !singmux_tcp_queue_data(slot, buffer, count))
+            if (count <= 0 || !singmux_tcp_queue_data(slot, stream_id, buffer, count))
             {
                 break;
             }
         }
-        if (slot < 0 || slot >= SINGMUX_TCP_STREAM_MAX || !s_singmux_tcp_streams[slot].in_use)
-        {
-            break;
-        }
         singmux_tcp_data_t *item = NULL;
-        while (xQueueReceive(s_singmux_tcp_streams[slot].receive_queue, &item, 0) == pdTRUE)
+        while (xQueueReceive(receive_queue, &item, 0) == pdTRUE)
         {
             if (!item)
             {
-                singmux_tcp_close(slot);
-                return;
+                detached = singmux_tcp_close(slot, stream_id);
+                goto done;
             }
             bool ok = socket_send_all(client, item->data, item->length);
             free(item);
             if (!ok)
             {
-                singmux_tcp_close(slot);
-                return;
+                goto close_stream;
             }
         }
+        /* A full queue can happen when this AP client cannot accept data
+         * quickly enough.  It must close only this stream, never the shared
+         * session carrying unrelated browser connections. */
+        if (s_singmux_tcp_streams[slot].peer_closed && uxQueueMessagesWaiting(receive_queue) == 0)
+        {
+            detached = singmux_tcp_close(slot, stream_id);
+            goto done;
+        }
     }
-    singmux_tcp_close(slot);
+close_stream:
+    detached = singmux_tcp_close(slot, stream_id);
+done:
+    if (detached)
+    {
+        singmux_tcp_data_t *item = NULL;
+        while (xQueueReceive(receive_queue, &item, 0) == pdTRUE)
+        {
+            free(item);
+        }
+        vQueueDelete(receive_queue);
+    }
 }
 
 static void transparent_client_task(void *arg)
@@ -1636,6 +2133,7 @@ static uint32_t s_udp_last_backpressure_log_ms;
 static int      udp_association_find_singmux_stream(uint32_t stream_id);
 static int      singmux_tcp_stream_find(uint32_t stream_id);
 static bool     singmux_receive_available(void);
+static bool     singmux_socket_readable(void);
 
 static uint32_t now_ms(void)
 {
@@ -1654,7 +2152,20 @@ static int singmux_tcp_stream_find(uint32_t stream_id)
     return -1;
 }
 
-static void singmux_tcp_stream_release(int slot)
+/* The relay task owns a queue after OPEN succeeds.  The manager only detaches
+ * the slot; the acknowledged relay then drains and deletes its own queue. */
+static void singmux_tcp_stream_detach(int slot)
+{
+    if (slot < 0 || slot >= SINGMUX_TCP_STREAM_MAX || !s_singmux_tcp_streams[slot].in_use)
+    {
+        return;
+    }
+    memset(&s_singmux_tcp_streams[slot], 0, sizeof(s_singmux_tcp_streams[slot]));
+}
+
+/* OPEN can fail before its caller receives a slot.  In that case no relay owns
+ * the queue, so the manager must reclaim it itself. */
+static void singmux_tcp_stream_discard(int slot)
 {
     if (slot < 0 || slot >= SINGMUX_TCP_STREAM_MAX || !s_singmux_tcp_streams[slot].in_use)
     {
@@ -1698,14 +2209,23 @@ static bool singmux_tcp_deliver(int slot, const uint8_t *payload, size_t length)
         heap_caps_malloc(sizeof(*item) + length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!item)
     {
-        return false;
+        s_singmux_stats.tcp_rx_alloc_failures++;
+        stream->peer_closed = true;
+        return true;
     }
     item->length = length;
     memcpy(item->data, payload, length);
     if (xQueueSend(stream->receive_queue, &item, 0) != pdTRUE)
     {
         free(item);
-        return false;
+        s_singmux_stats.tcp_rx_queue_full++;
+        stream->peer_closed = true;
+        return true;
+    }
+    UBaseType_t depth = uxQueueMessagesWaiting(stream->receive_queue);
+    if (depth > s_singmux_stats.tcp_rx_queue_high_water)
+    {
+        s_singmux_stats.tcp_rx_queue_high_water = (uint16_t)depth;
     }
     bandwidth_record_download(length);
     return true;
@@ -1716,7 +2236,7 @@ static bool singmux_tcp_notify_closed(int slot)
     singmux_tcp_data_t   *end    = NULL;
     singmux_tcp_stream_t *stream = &s_singmux_tcp_streams[slot];
     stream->peer_closed          = true;
-    return xQueueSend(stream->receive_queue, &end, 0) == pdTRUE;
+    return stream->receive_queue && xQueueSend(stream->receive_queue, &end, 0) == pdTRUE;
 }
 
 static void singmux_tcp_notify_all_closed(void)
@@ -1981,12 +2501,13 @@ static void singmux_process_control(void)
             free(control.data);
             if (!ok && slot >= 0)
             {
-                singmux_tcp_stream_release(slot);
+                singmux_tcp_stream_discard(slot);
             }
             xTaskNotify(control.reply_task, ok ? (uint32_t)(slot + 1) : 0, eSetValueWithOverwrite);
         }
         else if (control.slot >= 0 && control.slot < SINGMUX_TCP_STREAM_MAX &&
-                 s_singmux_tcp_streams[control.slot].in_use)
+                 s_singmux_tcp_streams[control.slot].in_use &&
+                 s_singmux_tcp_streams[control.slot].stream_id == control.stream_id)
         {
             singmux_tcp_stream_t *stream = &s_singmux_tcp_streams[control.slot];
             bool                  ok     = s_singmux_tunnel >= 0;
@@ -2005,12 +2526,15 @@ static void singmux_process_control(void)
                 {
                     singmux_send_frame(s_singmux_tunnel, SMUX_CMD_FIN, stream->stream_id, NULL, 0);
                 }
-                singmux_tcp_stream_release(control.slot);
+                singmux_tcp_stream_detach(control.slot);
+                xTaskNotify(control.reply_task, 1, eSetValueWithOverwrite);
             }
             free(control.data);
-            if (!ok)
+            if (!ok && control.type == SINGMUX_CONTROL_DATA)
             {
-                singmux_tcp_stream_release(control.slot);
+                /* Keep the queue alive until its relay receives the sentinel
+                 * and acknowledges CLOSE; deleting it here races xQueueReceive. */
+                singmux_tcp_notify_closed(control.slot);
             }
         }
         else
@@ -2023,6 +2547,7 @@ static void singmux_process_control(void)
 static void transparent_udp_manager_task(void *arg)
 {
     (void)arg;
+    uint8_t smux_receive_burst = 0;
     for (;;)
     {
         if (s_transport_reset_requested)
@@ -2045,13 +2570,19 @@ static void transparent_udp_manager_task(void *arg)
         }
         bool use_vless = transparent_mode_uses_vless();
         singmux_process_control();
+        /* Do not add the normal ingress wait to an active TCP download.  More
+         * importantly, singmux_receive_available() parses one socket read at a
+         * time, so each pass frees reassembly space before accepting more. */
+        bool smux_receive_pending = use_vless && s_config.singmux_enabled &&
+                                    s_singmux_tunnel >= 0 && singmux_socket_readable();
         /* Give control and UDP equal bounded service.  Draining all TCP controls first can
            indefinitely starve queued XUDP traffic when relay tasks remain busy. */
         for (size_t processed = 0; processed < UDP_MANAGER_BATCH_MAX; ++processed)
         {
             udp_ingress_t ingress;
             if (xQueueReceive(s_udp_manager_queue, &ingress,
-                              pdMS_TO_TICKS(processed == 0 ? 20 : 0)) != pdTRUE)
+                              pdMS_TO_TICKS(processed == 0 && !smux_receive_pending ? 20 : 0)) !=
+                pdTRUE)
             {
                 break;
             }
@@ -2224,8 +2755,15 @@ static void transparent_udp_manager_task(void *arg)
             if (use_vless && s_config.singmux_enabled && s_singmux_tunnel >= 0 &&
                 FD_ISSET(s_singmux_tunnel, &reads) && !singmux_receive_available())
             {
+                s_singmux_stats.sessions_closed++;
+                s_singmux_stats.last_session_close_ms = now_ms();
                 ESP_LOGW(TAG,
-                         "sing-box smux session closed; associations will reconnect on demand");
+                         "sing-box smux session closed (EOF=%u socket=%u protocol=%u errno=%d); "
+                         "associations will reconnect on demand",
+                         (unsigned)s_singmux_stats.close_eof,
+                         (unsigned)s_singmux_stats.close_socket_error,
+                         (unsigned)s_singmux_stats.close_protocol_error,
+                         s_singmux_stats.last_socket_errno);
                 close(s_singmux_tunnel);
                 s_singmux_tunnel    = -1;
                 s_singmux_rx_length = 0;
@@ -2266,6 +2804,23 @@ static void transparent_udp_manager_task(void *arg)
             {
                 udp_association_release(i);
             }
+        }
+        /* A continuously readable smux socket otherwise keeps this priority-5
+         * task runnable forever and starves same-priority HTTP/relay tasks.
+         * Four 4 KiB passes per tick preserves responsiveness without imposing
+         * a roughly 400 KiB/s ceiling on a sustained download. */
+        if (smux_receive_pending)
+        {
+            if (++smux_receive_burst >= 4)
+            {
+                smux_receive_burst = 0;
+                s_singmux_stats.scheduler_yields++;
+                vTaskDelay(1);
+            }
+        }
+        else
+        {
+            smux_receive_burst = 0;
         }
     }
 }
@@ -2666,6 +3221,45 @@ static esp_err_t config_post(httpd_req_t *req)
     return send_json(req, "{\"message\":\"VLESS configuration saved.\"}");
 }
 
+/* Physical serial and the BOOT button already support a temporary direct
+   route.  Expose the same recovery diagnostic through authenticated local
+   management so a held USB console cannot prevent an A/B throughput test. */
+static esp_err_t route_post(httpd_req_t *req)
+{
+    if (require_admin_auth(req) != ESP_OK)
+    {
+        return ESP_FAIL;
+    }
+    if (req->content_len == 0 || req->content_len > 32)
+    {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Use mode=vless or mode=direct");
+    }
+    char body[33] = {0};
+    int  total    = 0;
+    while (total < req->content_len)
+    {
+        int received = httpd_req_recv(req, body + total, req->content_len - total);
+        if (received <= 0)
+        {
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Incomplete route form");
+        }
+        total += received;
+    }
+    char mode[12] = {0};
+    if (!form_value(body, "mode", mode, sizeof(mode)) ||
+        (strcmp(mode, "vless") != 0 && strcmp(mode, "direct") != 0))
+    {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Use mode=vless or mode=direct");
+    }
+    set_transparent_mode(strcmp(mode, "direct") == 0 ? TRANSPARENT_MODE_UPSTREAM
+                                                     : TRANSPARENT_MODE_VLESS);
+    ESP_LOGW(TAG, "Authenticated local route test selected %s for this boot", mode);
+    return send_json(
+        req, transparent_mode_uses_vless()
+                 ? "{\"message\":\"VLESS route active for this boot.\"}"
+                 : "{\"message\":\"DIRECT route active for this boot; traffic bypasses VLESS.\"}");
+}
+
 static void json_string(httpd_req_t *req, const char *text)
 {
     httpd_resp_sendstr_chunk(req, "\"");
@@ -2944,7 +3538,7 @@ static void start_http_server(void)
     httpd_handle_t server   = NULL;
     httpd_config_t config   = HTTPD_DEFAULT_CONFIG();
     config.stack_size       = 8192;
-    config.max_uri_handlers = 14;
+    config.max_uri_handlers = 15;
     config.lru_purge_enable = true;
     config.uri_match_fn     = httpd_uri_match_wildcard;
     ESP_ERROR_CHECK(httpd_start(&server, &config));
@@ -2956,10 +3550,12 @@ static void start_http_server(void)
                                          .user_ctx = (void *)CONFIG_SECTION_UPSTREAM};
     const httpd_uri_t upstream_delete = {
         .uri = "/api/upstream-delete", .method = HTTP_POST, .handler = upstream_delete_post};
-    const httpd_uri_t vless_post         = {.uri      = "/api/vless",
-                                            .method   = HTTP_POST,
-                                            .handler  = config_post,
-                                            .user_ctx = (void *)CONFIG_SECTION_VLESS};
+    const httpd_uri_t vless_post     = {.uri      = "/api/vless",
+                                        .method   = HTTP_POST,
+                                        .handler  = config_post,
+                                        .user_ctx = (void *)CONFIG_SECTION_VLESS};
+    const httpd_uri_t route_post_uri = {
+        .uri = "/api/route", .method = HTTP_POST, .handler = route_post};
     const httpd_uri_t ap_post            = {.uri      = "/api/access-point",
                                             .method   = HTTP_POST,
                                             .handler  = config_post,
@@ -2980,6 +3576,7 @@ static void start_http_server(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &upstream_post));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &upstream_delete));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &vless_post));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &route_post_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &ap_post));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &admin_password_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &vless_test));
@@ -3298,8 +3895,8 @@ static void serial_console_task(void *arg)
 {
     (void)arg;
     char line[384];
-    ESP_LOGI(TAG,
-             "Serial commands: help; status; wifi; ap; apip; vless; vless-uri; dns; mux; admin");
+    ESP_LOGI(TAG, "Serial commands: help; status; diag; route; wifi; ap; apip; vless; vless-uri; "
+                  "dns; mux; admin");
     for (;;)
     {
         if (!fgets(line, sizeof(line), stdin))
@@ -3322,7 +3919,9 @@ static void serial_console_task(void *arg)
         }
         if (strcmp(command, "help") == 0)
         {
-            ESP_LOGI(TAG, "status; wifi <ssid> [password]; ap <ssid> <password>");
+            ESP_LOGI(
+                TAG,
+                "status; diag; route <vless|direct>; wifi <ssid> [password]; ap <ssid> <password>");
             ESP_LOGI(TAG, "apip <IPv4 ending in .1>");
             ESP_LOGI(TAG, "vless <host> <port> <uuid>; vless-uri <uri>; dns <host|clear>");
             ESP_LOGI(TAG, "mux <on|off>; admin <new-password>");
@@ -3337,6 +3936,24 @@ static void serial_console_task(void *arg)
                      configured_ap_ipv4(&s_config), s_config.upstream_ssid, transparent_mode_name(),
                      s_config.vless_host, s_config.vless_port, s_config.dns_resolver,
                      s_config.singmux_enabled ? "enabled" : "disabled");
+            continue;
+        }
+        if (strcmp(command, "diag") == 0)
+        {
+            serial_diagnostics();
+            continue;
+        }
+        if (strcmp(command, "route") == 0)
+        {
+            if (!first || second || (strcmp(first, "vless") != 0 && strcmp(first, "direct") != 0))
+            {
+                ESP_LOGW(TAG, "Usage: route <vless|direct>");
+                continue;
+            }
+            set_transparent_mode(strcmp(first, "vless") == 0 ? TRANSPARENT_MODE_VLESS
+                                                             : TRANSPARENT_MODE_UPSTREAM);
+            ESP_LOGW(TAG, "Route is %s for this boot; direct bypasses VLESS for TCP and UDP",
+                     transparent_mode_uses_vless() ? "VLESS" : "DIRECT");
             continue;
         }
         if (strcmp(command, "mux") == 0)
@@ -3550,28 +4167,34 @@ static bool singmux_deliver_udp(udp_association_t *association, const uint8_t *p
 
 static bool singmux_receive_available(void)
 {
-    uint8_t received[1024];
-    for (;;)
+    int bytes = recv(s_singmux_tunnel, s_singmux_socket_read_buffer,
+                     sizeof(s_singmux_socket_read_buffer), MSG_DONTWAIT);
+    if (bytes > 0)
     {
-        int bytes = recv(s_singmux_tunnel, received, sizeof(received), MSG_DONTWAIT);
-        if (bytes > 0)
+        s_singmux_stats.rx_reads++;
+        if ((size_t)bytes > SINGMUX_RX_BUFFER_MAX - s_singmux_rx_length)
         {
-            if ((size_t)bytes > SINGMUX_RX_BUFFER_MAX - s_singmux_rx_length)
-            {
-                return false;
-            }
-            memcpy(s_singmux_rx_buffer + s_singmux_rx_length, received, bytes);
-            s_singmux_rx_length += (size_t)bytes;
-            continue;
-        }
-        if (bytes == 0)
-        {
+            s_singmux_stats.close_protocol_error++;
+            ESP_LOGW(TAG, "smux reassembly buffer full (%u bytes)", (unsigned)s_singmux_rx_length);
             return false;
         }
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
+        memcpy(s_singmux_rx_buffer + s_singmux_rx_length, s_singmux_socket_read_buffer, bytes);
+        s_singmux_rx_length += (size_t)bytes;
+        if (s_singmux_rx_length > s_singmux_stats.rx_reassembly_high_water)
         {
-            break;
+            s_singmux_stats.rx_reassembly_high_water = (uint32_t)s_singmux_rx_length;
         }
+        s_singmux_stats.rx_wire_bytes += (size_t)bytes;
+    }
+    else if (bytes == 0)
+    {
+        s_singmux_stats.close_eof++;
+        return false;
+    }
+    else if (errno != EAGAIN && errno != EWOULDBLOCK)
+    {
+        s_singmux_stats.close_socket_error++;
+        s_singmux_stats.last_socket_errno = errno;
         return false;
     }
     size_t consumed = 0;
@@ -3584,6 +4207,7 @@ static bool singmux_receive_available(void)
         size_t addon_length = s_singmux_rx_buffer[1];
         if (s_singmux_rx_buffer[0] != 0 || s_singmux_rx_length < addon_length + 2)
         {
+            s_singmux_stats.close_protocol_error++;
             return false;
         }
         consumed                         = addon_length + 2;
@@ -3597,6 +4221,7 @@ static bool singmux_receive_available(void)
         uint8_t *frame = s_singmux_rx_buffer + consumed;
         if (!singmux_decode_smux_header(frame, &command, &stream_id, &payload_length))
         {
+            s_singmux_stats.close_protocol_error++;
             return false;
         }
         if (s_singmux_rx_length - consumed < SMUX_HEADER_SIZE + payload_length)
@@ -3610,6 +4235,7 @@ static bool singmux_receive_available(void)
             if (command == SMUX_CMD_PSH &&
                 !singmux_deliver_udp(association, frame + SMUX_HEADER_SIZE, payload_length))
             {
+                s_singmux_stats.close_protocol_error++;
                 return false;
             }
             if (command == SMUX_CMD_FIN)
@@ -3625,6 +4251,7 @@ static bool singmux_receive_available(void)
                 if (command == SMUX_CMD_PSH &&
                     !singmux_tcp_deliver(tcp_slot, frame + SMUX_HEADER_SIZE, payload_length))
                 {
+                    s_singmux_stats.close_protocol_error++;
                     return false;
                 }
                 if (command == SMUX_CMD_FIN)
@@ -3633,6 +4260,7 @@ static bool singmux_receive_available(void)
                 }
             }
         }
+        s_singmux_stats.rx_frames++;
         consumed += SMUX_HEADER_SIZE + payload_length;
     }
     if (consumed)
@@ -3642,6 +4270,20 @@ static bool singmux_receive_available(void)
         s_singmux_rx_length -= consumed;
     }
     return true;
+}
+
+static bool singmux_socket_readable(void)
+{
+    if (s_singmux_tunnel < 0)
+    {
+        return false;
+    }
+    fd_set reads;
+    FD_ZERO(&reads);
+    FD_SET(s_singmux_tunnel, &reads);
+    struct timeval timeout = {.tv_sec = 0, .tv_usec = 0};
+    return select(s_singmux_tunnel + 1, &reads, NULL, NULL, &timeout) > 0 &&
+           FD_ISSET(s_singmux_tunnel, &reads);
 }
 
 void app_main(void)
@@ -3671,9 +4313,14 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     apply_access_point_config();
     ESP_ERROR_CHECK(esp_wifi_start());
+    /* STA modem sleep adds latency and can throttle AP+STA forwarding.  A
+       mains/USB-powered router should prefer predictable forwarding latency. */
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    initialize_device_health_monitoring();
     xTaskCreate(captive_dns_task, "captive_dns", 6144, NULL, 4, NULL);
     xTaskCreate(factory_reset_button_task, "factory_reset", 2048, NULL, 4, NULL);
     xTaskCreate(serial_console_task, "serial_console", 4096, NULL, 4, NULL);
+    xTaskCreate(bandwidth_sampler_task, "bandwidth_sampler", 2048, NULL, 3, NULL);
     xTaskCreate(socks_server_task, "socks_server", 4096, NULL, 5, NULL);
     xTaskCreate(transparent_server_task, "transparent_server", 6144, NULL, 5, NULL);
     xTaskCreate(transparent_udp_server_task, "transparent_udp_server", 4096, NULL, 5, NULL);
