@@ -55,10 +55,11 @@
 #define SINGMUX_TCP_STREAM_MAX 80
 #define SINGMUX_CONTROL_QUEUE_DEPTH 96
 #define SINGMUX_CONTROL_BATCH_MAX 8
-#define SINGMUX_TCP_RX_QUEUE_DEPTH 12
+#define SINGMUX_TCP_RX_QUEUE_DEPTH 24
 #define SINGMUX_TCP_DATA_MAX 2048
 #define UDP_MANAGER_BATCH_MAX 8
 #define OTA_UPLOAD_BUFFER_SIZE 1024
+#define BANDWIDTH_HISTORY_SECONDS 30
 
 /* Set -DVLESS_TRAFFIC_LOGS=1 in platformio.ini when packet-by-packet relay
    diagnostics are needed. It is off by default to keep the console usable. */
@@ -89,6 +90,10 @@ typedef struct
     uint64_t download_bytes;
     uint32_t upload_bps;
     uint32_t download_bps;
+    uint32_t upload_bps_10s;
+    uint32_t download_bps_10s;
+    uint32_t upload_bps_30s;
+    uint32_t download_bps_30s;
 } bandwidth_stats_t;
 
 /* These are deliberately aggregate and lock-free: their purpose is to show
@@ -109,6 +114,9 @@ typedef struct
     uint32_t tcp_control_queue_timeouts;
     uint32_t tcp_stream_open_failures;
     uint16_t tcp_rx_queue_high_water;
+    uint32_t rx_reads;
+    uint32_t scheduler_yields;
+    uint32_t rx_reassembly_high_water;
     uint32_t last_session_open_ms;
     uint32_t last_session_close_ms;
     int      last_socket_errno;
@@ -167,6 +175,16 @@ static uint64_t             s_download_bytes;
 static uint64_t             s_sample_upload_bytes;
 static uint64_t             s_sample_download_bytes;
 static uint32_t             s_sample_time_ms;
+/* A sampler, rather than HTTP/serial polling, owns these time windows.  This
+ * lets us compare a transfer's opening seconds with its sustained rate. */
+static uint32_t             s_upload_history[BANDWIDTH_HISTORY_SECONDS];
+static uint32_t             s_download_history[BANDWIDTH_HISTORY_SECONDS];
+static uint8_t              s_bandwidth_history_next;
+static uint8_t              s_bandwidth_history_count;
+static uint32_t             s_upload_bps_10s;
+static uint32_t             s_download_bps_10s;
+static uint32_t             s_upload_bps_30s;
+static uint32_t             s_download_bps_30s;
 static int                  s_singmux_tunnel         = -1;
 static uint32_t             s_singmux_next_stream_id = 3;
 static uint8_t             *s_singmux_rx_buffer;
@@ -200,6 +218,68 @@ static void apply_access_point_task(void *argument);
 static void reset_transparent_transport_state(void);
 static void set_transparent_mode(transparent_mode_t mode);
 static void schedule_boot_upstream_scan(void);
+
+static uint32_t bandwidth_window_bps(const uint32_t *history, uint8_t count,
+                                     uint8_t next, uint8_t seconds)
+{
+    uint8_t window = count < seconds ? count : seconds;
+    if (!window)
+    {
+        return 0;
+    }
+    uint64_t total = 0;
+    for (uint8_t offset = 0; offset < window; ++offset)
+    {
+        uint8_t index = (uint8_t)((next + BANDWIDTH_HISTORY_SECONDS - 1 - offset) %
+                                  BANDWIDTH_HISTORY_SECONDS);
+        total += history[index];
+    }
+    return (uint32_t)(total / window);
+}
+
+static void bandwidth_sampler_task(void *argument)
+{
+    (void)argument;
+    uint64_t previous_upload = 0;
+    uint64_t previous_download = 0;
+    bool     initialized = false;
+    TickType_t wake_time = xTaskGetTickCount();
+    for (;;)
+    {
+        vTaskDelayUntil(&wake_time, pdMS_TO_TICKS(1000));
+        portENTER_CRITICAL(&s_bandwidth_lock);
+        if (!initialized)
+        {
+            previous_upload   = s_upload_bytes;
+            previous_download = s_download_bytes;
+            initialized       = true;
+        }
+        else
+        {
+            s_upload_history[s_bandwidth_history_next] =
+                (uint32_t)(s_upload_bytes - previous_upload);
+            s_download_history[s_bandwidth_history_next] =
+                (uint32_t)(s_download_bytes - previous_download);
+            previous_upload   = s_upload_bytes;
+            previous_download = s_download_bytes;
+            s_bandwidth_history_next =
+                (uint8_t)((s_bandwidth_history_next + 1) % BANDWIDTH_HISTORY_SECONDS);
+            if (s_bandwidth_history_count < BANDWIDTH_HISTORY_SECONDS)
+            {
+                ++s_bandwidth_history_count;
+            }
+            s_upload_bps_10s = bandwidth_window_bps(s_upload_history, s_bandwidth_history_count,
+                                                     s_bandwidth_history_next, 10);
+            s_download_bps_10s = bandwidth_window_bps(
+                s_download_history, s_bandwidth_history_count, s_bandwidth_history_next, 10);
+            s_upload_bps_30s = bandwidth_window_bps(s_upload_history, s_bandwidth_history_count,
+                                                     s_bandwidth_history_next, 30);
+            s_download_bps_30s = bandwidth_window_bps(
+                s_download_history, s_bandwidth_history_count, s_bandwidth_history_next, 30);
+        }
+        portEXIT_CRITICAL(&s_bandwidth_lock);
+    }
+}
 
 static bool text_changed(const char *left, const char *right)
 {
@@ -260,7 +340,14 @@ static bandwidth_stats_t bandwidth_snapshot(void)
         s_sample_upload_bytes   = s_upload_bytes;
         s_sample_download_bytes = s_download_bytes;
     }
-    stats = (bandwidth_stats_t){s_upload_bytes, s_download_bytes, s_upload_bps, s_download_bps};
+    stats = (bandwidth_stats_t){s_upload_bytes,
+                                s_download_bytes,
+                                s_upload_bps,
+                                s_download_bps,
+                                s_upload_bps_10s,
+                                s_download_bps_10s,
+                                s_upload_bps_30s,
+                                s_download_bps_30s};
     portEXIT_CRITICAL(&s_bandwidth_lock);
     return stats;
 }
@@ -289,11 +376,12 @@ static void serial_diagnostics(void)
     ESP_LOGI(TAG,
              "DIAG route=%s upstream=%s Wi-Fi channel=%u secondary=%d AP-clients=%u; "
              "TCP wnd=32768 snd=32768 recvmbox=32; payload up=%u B/s down=%u B/s "
-             "(%.2f/%.2f Mbps)",
+             "(%.2f/%.2f Mbps); rolling 10s up/down=%u/%u B/s, 30s=%u/%u B/s",
              transparent_mode_name(), s_has_upstream ? "up" : "down", primary, (int)secondary,
              client_result == ESP_OK ? clients.num : 0, bandwidth.upload_bps,
              bandwidth.download_bps, bandwidth.upload_bps * 8.0 / 1000000.0,
-             bandwidth.download_bps * 8.0 / 1000000.0);
+             bandwidth.download_bps * 8.0 / 1000000.0, bandwidth.upload_bps_10s,
+             bandwidth.download_bps_10s, bandwidth.upload_bps_30s, bandwidth.download_bps_30s);
     if (upstream_result == ESP_OK)
     {
         ESP_LOGI(TAG, "DIAG uplink RSSI=%d dBm channel=%u auth=%d", upstream.rssi,
@@ -317,7 +405,7 @@ static void serial_diagnostics(void)
     ESP_LOGI(TAG,
              "DIAG smux: sessions open/closed=%u/%u EOF=%u socket=%u protocol=%u last_errno=%d "
              "wire tx/rx=%llu/%llu frames=%u/%u; TCP rx queue high=%u/%u full=%u alloc_fail=%u "
-             "control_timeout=%u open_fail=%u",
+             "control_timeout=%u open_fail=%u; reads=%u yields=%u reassembly_high=%u",
              (unsigned)s_singmux_stats.sessions_opened, (unsigned)s_singmux_stats.sessions_closed,
              (unsigned)s_singmux_stats.close_eof, (unsigned)s_singmux_stats.close_socket_error,
              (unsigned)s_singmux_stats.close_protocol_error, s_singmux_stats.last_socket_errno,
@@ -327,7 +415,9 @@ static void serial_diagnostics(void)
              SINGMUX_TCP_RX_QUEUE_DEPTH, (unsigned)s_singmux_stats.tcp_rx_queue_full,
              (unsigned)s_singmux_stats.tcp_rx_alloc_failures,
              (unsigned)s_singmux_stats.tcp_control_queue_timeouts,
-             (unsigned)s_singmux_stats.tcp_stream_open_failures);
+             (unsigned)s_singmux_stats.tcp_stream_open_failures,
+             (unsigned)s_singmux_stats.rx_reads, (unsigned)s_singmux_stats.scheduler_yields,
+             (unsigned)s_singmux_stats.rx_reassembly_high_water);
 }
 
 static bool access_point_ip_info(esp_netif_ip_info_t *info)
@@ -1078,7 +1168,10 @@ static esp_err_t config_get(httpd_req_t *req)
         "\"singmux_tx_frames\":%u,\"singmux_rx_frames\":%u,\"singmux_tcp_rx_queue_high_water\":%u,"
         "\"singmux_tcp_rx_queue_full\":%u,\"singmux_tcp_rx_alloc_failures\":%u,"
         "\"singmux_control_timeouts\":%u,\"singmux_tcp_open_failures\":%u,"
-        "\"up_bps\":%u,\"down_bps\":%u,\"up_bytes\":%llu,\"down_bytes\":%llu,"
+        "\"singmux_rx_reads\":%u,\"singmux_scheduler_yields\":%u,"
+        "\"singmux_rx_reassembly_high_water\":%u,"
+        "\"up_bps\":%u,\"down_bps\":%u,\"up_bps_10s\":%u,\"down_bps_10s\":%u,"
+        "\"up_bps_30s\":%u,\"down_bps_30s\":%u,\"up_bytes\":%llu,\"down_bytes\":%llu,"
         "\"free_internal\":%u,\"largest_internal_block\":%u,\"free_psram\":%u,"
         "\"free_total\":%u}",
         s_config.vless_host, s_config.vless_port, s_config.dns_resolver,
@@ -1100,7 +1193,11 @@ static esp_err_t config_get(httpd_req_t *req)
         (unsigned)s_singmux_stats.tcp_rx_alloc_failures,
         (unsigned)s_singmux_stats.tcp_control_queue_timeouts,
         (unsigned)s_singmux_stats.tcp_stream_open_failures,
+        (unsigned)s_singmux_stats.rx_reads, (unsigned)s_singmux_stats.scheduler_yields,
+        (unsigned)s_singmux_stats.rx_reassembly_high_water,
         (unsigned)bandwidth.upload_bps, (unsigned)bandwidth.download_bps,
+        (unsigned)bandwidth.upload_bps_10s, (unsigned)bandwidth.download_bps_10s,
+        (unsigned)bandwidth.upload_bps_30s, (unsigned)bandwidth.download_bps_30s,
         (unsigned long long)bandwidth.upload_bytes, (unsigned long long)bandwidth.download_bytes,
         (unsigned)free_internal, (unsigned)largest_internal_block, (unsigned)free_psram,
         (unsigned)free_total);
@@ -1727,7 +1824,11 @@ static void relay_singmux_tcp_stream(int client, int slot)
         fd_set reads;
         FD_ZERO(&reads);
         FD_SET(client, &reads);
-        struct timeval timeout = {.tv_sec = 0, .tv_usec = 20000};
+        /* When downstream data is already queued, drain it immediately rather
+         * than waiting a full 20 ms for client input.  The latter let a fast
+         * smux download fill a 12-frame queue and terminate that stream. */
+        bool have_downstream = uxQueueMessagesWaiting(receive_queue) != 0;
+        struct timeval timeout = {.tv_sec = 0, .tv_usec = have_downstream ? 0 : 20000};
         int            ready   = select(client + 1, &reads, NULL, NULL, &timeout);
         if (ready > 0 && FD_ISSET(client, &reads))
         {
@@ -2638,6 +2739,7 @@ static void transparent_udp_manager_task(void *arg)
             if (++smux_receive_burst >= 4)
             {
                 smux_receive_burst = 0;
+                s_singmux_stats.scheduler_yields++;
                 vTaskDelay(1);
             }
         }
@@ -3992,6 +4094,7 @@ static bool singmux_receive_available(void)
                      sizeof(s_singmux_socket_read_buffer), MSG_DONTWAIT);
     if (bytes > 0)
     {
+        s_singmux_stats.rx_reads++;
         if ((size_t)bytes > SINGMUX_RX_BUFFER_MAX - s_singmux_rx_length)
         {
             s_singmux_stats.close_protocol_error++;
@@ -4001,6 +4104,10 @@ static bool singmux_receive_available(void)
         }
         memcpy(s_singmux_rx_buffer + s_singmux_rx_length, s_singmux_socket_read_buffer, bytes);
         s_singmux_rx_length += (size_t)bytes;
+        if (s_singmux_rx_length > s_singmux_stats.rx_reassembly_high_water)
+        {
+            s_singmux_stats.rx_reassembly_high_water = (uint32_t)s_singmux_rx_length;
+        }
         s_singmux_stats.rx_wire_bytes += (size_t)bytes;
     }
     else if (bytes == 0)
@@ -4136,6 +4243,7 @@ void app_main(void)
     xTaskCreate(captive_dns_task, "captive_dns", 6144, NULL, 4, NULL);
     xTaskCreate(factory_reset_button_task, "factory_reset", 2048, NULL, 4, NULL);
     xTaskCreate(serial_console_task, "serial_console", 4096, NULL, 4, NULL);
+    xTaskCreate(bandwidth_sampler_task, "bandwidth_sampler", 2048, NULL, 3, NULL);
     xTaskCreate(socks_server_task, "socks_server", 4096, NULL, 5, NULL);
     xTaskCreate(transparent_server_task, "transparent_server", 6144, NULL, 5, NULL);
     xTaskCreate(transparent_udp_server_task, "transparent_udp_server", 4096, NULL, 5, NULL);
