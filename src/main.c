@@ -54,8 +54,12 @@
 #define UDP_QUEUE_SEND_WAIT_MS 2
 /* smux keeps transport sockets scarce.  TCP payloads themselves are allocated
    in PSRAM and only pointers travel through this small control queue. */
-#define SINGMUX_TCP_STREAM_MAX 80
-#define SINGMUX_CONTROL_QUEUE_DEPTH 96
+#define SINGMUX_TCP_STREAM_MAX 100
+/* Absorb a browser's burst of SYN/data/FIN control messages without making
+   the manager's queue
+ * the limiting factor before all 100 stream slots can be
+   used. */
+#define SINGMUX_CONTROL_QUEUE_DEPTH 120
 #define SINGMUX_CONTROL_BATCH_MAX 8
 #define SINGMUX_TCP_RX_QUEUE_DEPTH 24
 #define SINGMUX_TCP_DATA_MAX 2048
