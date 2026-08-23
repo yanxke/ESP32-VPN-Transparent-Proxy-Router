@@ -7,8 +7,8 @@
 /* Keep the interception table aligned with the smux stream limit.  Otherwise
  * increasing SINGMUX_TCP_STREAM_MAX only admits streams after the transparent
  * flow table has already rejected their client connections. */
-#define TRANSPARENT_TCP_MAX_FLOWS 80
-#define TRANSPARENT_TCP_LISTEN_BACKLOG 64
+#define TRANSPARENT_TCP_MAX_FLOWS 100
+#define TRANSPARENT_TCP_LISTEN_BACKLOG 96
 #define TRANSPARENT_UDP_MAX_FLOWS 128
 #define TRANSPARENT_UDP_RELAY_PORT 15002
 

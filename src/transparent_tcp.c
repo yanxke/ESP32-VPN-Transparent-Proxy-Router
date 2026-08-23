@@ -58,68 +58,37 @@ static bool is_link_local_multicast_or_broadcast(uint32_t destination_ip)
     return address[0] >= 224;
 }
 
-static uint32_t checksum_bytes(uint32_t sum, const uint8_t *data, size_t length, bool *odd,
-                               uint8_t *tail)
+/* RFC 1624 incremental Internet checksum update.  Redirecting a packet changes
+ * only four 16-bit
+ * words (IPv4 source/destination and the two ports), so
+ * rescanning every payload byte is
+ * needless work in the AP+STA hot path. */
+static uint16_t checksum_replace(uint16_t checksum, uint16_t old_word, uint16_t new_word)
 {
-    if (*odd && length)
-    {
-        sum += ((uint16_t)*tail << 8) | *data++;
-        length--;
-        *odd = false;
-    }
-    while (length >= 2)
-    {
-        sum += ((uint16_t)data[0] << 8) | data[1];
-        data += 2;
-        length -= 2;
-    }
-    if (length)
-    {
-        *tail = *data;
-        *odd  = true;
-    }
-    return sum;
-}
-
-static uint16_t checksum_finish(uint32_t sum, bool odd, uint8_t tail)
-{
-    if (odd)
-    {
-        sum += (uint16_t)tail << 8;
-    }
-    while (sum >> 16)
-    {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
+    uint32_t sum = (uint16_t)~checksum + (uint16_t)~old_word + new_word;
+    sum          = (sum & 0xffff) + (sum >> 16);
+    sum          = (sum & 0xffff) + (sum >> 16);
     return (uint16_t)~sum;
 }
 
-static uint16_t pbuf_checksum(const struct pbuf *packet, size_t offset, size_t length,
-                              uint32_t seed)
+static uint16_t read_u16(const uint8_t *data)
 {
-    uint8_t  scratch[96];
-    bool     odd  = false;
-    uint8_t  tail = 0;
-    uint32_t sum  = seed;
-    while (length)
-    {
-        size_t count = length > sizeof(scratch) ? sizeof(scratch) : length;
-        if (pbuf_copy_partial(packet, scratch, count, offset) != count)
-        {
-            return 0;
-        }
-        sum = checksum_bytes(sum, scratch, count, &odd, &tail);
-        offset += count;
-        length -= count;
-    }
-    return checksum_finish(sum, odd, tail);
+    return ((uint16_t)data[0] << 8) | data[1];
+}
+
+static uint16_t checksum_replace_u32(uint16_t checksum, uint32_t old_value, uint32_t new_value)
+{
+    const uint8_t *old_bytes = (const uint8_t *)&old_value;
+    const uint8_t *new_bytes = (const uint8_t *)&new_value;
+    checksum                 = checksum_replace(checksum, read_u16(old_bytes), read_u16(new_bytes));
+    return checksum_replace(checksum, read_u16(old_bytes + 2), read_u16(new_bytes + 2));
 }
 
 static bool rewrite_packet(struct pbuf *packet, const uint8_t ip_header[60], uint8_t ihl,
                            uint32_t source_ip, uint16_t source_port, uint32_t destination_ip,
                            uint16_t destination_port)
 {
-    uint16_t total_length    = ((uint16_t)ip_header[2] << 8) | ip_header[3];
+    uint16_t total_length    = read_u16(ip_header + 2);
     uint8_t  protocol        = ip_header[9];
     uint16_t minimum_length  = protocol == 6 ? 20 : (protocol == 17 ? 8 : 0);
     uint16_t checksum_offset = protocol == 6 ? 16 : 6;
@@ -127,18 +96,33 @@ static bool rewrite_packet(struct pbuf *packet, const uint8_t ip_header[60], uin
     {
         return false;
     }
-    /* Maximum IPv4 header (60 bytes) plus the first four transport bytes. */
     uint8_t header[64];
     memcpy(header, ip_header, ihl);
+    uint32_t old_source_ip;
+    uint32_t old_destination_ip;
+    memcpy(&old_source_ip, ip_header + 12, sizeof(old_source_ip));
+    memcpy(&old_destination_ip, ip_header + 16, sizeof(old_destination_ip));
+    uint16_t old_ip_checksum = read_u16(header + 10);
+    uint8_t  old_ports[4];
+    if (pbuf_copy_partial(packet, old_ports, sizeof(old_ports), ihl) != sizeof(old_ports))
+    {
+        return false;
+    }
+    uint16_t old_source_port      = read_u16(old_ports);
+    uint16_t old_destination_port = read_u16(old_ports + 2);
+    uint8_t  transport_checksum_bytes[2];
+    if (pbuf_copy_partial(packet, transport_checksum_bytes, sizeof(transport_checksum_bytes),
+                          ihl + checksum_offset) != sizeof(transport_checksum_bytes))
+    {
+        return false;
+    }
+    uint16_t transport_checksum = read_u16(transport_checksum_bytes);
     memcpy(header + 12, &source_ip, sizeof(source_ip));
     memcpy(header + 16, &destination_ip, sizeof(destination_ip));
-    header[10] = header[11] = 0;
-    bool     odd            = false;
-    uint8_t  tail           = 0;
-    uint32_t ip_sum         = checksum_bytes(0, header, ihl, &odd, &tail);
-    uint16_t ip_checksum    = checksum_finish(ip_sum, odd, tail);
-    header[10]              = ip_checksum >> 8;
-    header[11]              = ip_checksum;
+    uint16_t ip_checksum = checksum_replace_u32(old_ip_checksum, old_source_ip, source_ip);
+    ip_checksum          = checksum_replace_u32(ip_checksum, old_destination_ip, destination_ip);
+    header[10]           = ip_checksum >> 8;
+    header[11]           = ip_checksum;
     if (pbuf_take_at(packet, header, ihl, 0) != ERR_OK)
     {
         return false;
@@ -149,31 +133,25 @@ static bool rewrite_packet(struct pbuf *packet, const uint8_t ip_header[60], uin
     {
         return false;
     }
-    uint8_t zero[2] = {0, 0};
-    if (pbuf_take_at(packet, zero, sizeof(zero), ihl + checksum_offset) != ERR_OK)
+    /* UDP over IPv4 may deliberately omit its checksum; preserve that case. */
+    if (transport_checksum == 0 && protocol == 17)
     {
-        return false;
+        return true;
     }
-    uint8_t pseudo[12];
-    memcpy(pseudo, &source_ip, 4);
-    memcpy(pseudo + 4, &destination_ip, 4);
-    pseudo[8]                 = 0;
-    pseudo[9]                 = protocol;
-    uint16_t transport_length = total_length - ihl;
-    pseudo[10]                = transport_length >> 8;
-    pseudo[11]                = transport_length;
-    bool     pseudo_odd       = false;
-    uint8_t  pseudo_tail      = 0;
-    uint32_t tcp_sum = checksum_bytes(0, pseudo, sizeof(pseudo), &pseudo_odd, &pseudo_tail);
-    /* The pseudo-header is even sized, so the TCP segment starts on a word boundary. */
-    uint16_t checksum = pbuf_checksum(packet, ihl, transport_length, tcp_sum);
-    if (protocol == 17 && checksum == 0)
+    transport_checksum = checksum_replace_u32(transport_checksum, old_source_ip, source_ip);
+    transport_checksum =
+        checksum_replace_u32(transport_checksum, old_destination_ip, destination_ip);
+    transport_checksum = checksum_replace(transport_checksum, old_source_port, source_port);
+    transport_checksum =
+        checksum_replace(transport_checksum, old_destination_port, destination_port);
+    if (protocol == 17 && transport_checksum == 0)
     {
-        checksum = 0xffff; /* RFC 768 wire representation. */
+        transport_checksum = 0xffff; /* RFC 768 wire representation. */
     }
-    uint8_t checksum_bytes[2] = {checksum >> 8, checksum};
-    return pbuf_take_at(packet, checksum_bytes, sizeof(checksum_bytes), ihl + checksum_offset) ==
-           ERR_OK;
+    transport_checksum_bytes[0] = transport_checksum >> 8;
+    transport_checksum_bytes[1] = transport_checksum;
+    return pbuf_take_at(packet, transport_checksum_bytes, sizeof(transport_checksum_bytes),
+                        ihl + checksum_offset) == ERR_OK;
 }
 
 int transparent_tcp_ip4_input(struct pbuf *packet, struct netif *input_netif)
