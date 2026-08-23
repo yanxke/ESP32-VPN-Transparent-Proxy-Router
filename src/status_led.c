@@ -7,6 +7,7 @@
 #include "esp_log.h"
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "status_led.h"
@@ -26,9 +27,10 @@ typedef struct
     rmt_symbol_word_t reset_code;
 } ws2812_encoder_t;
 
-static const char         *s_tag;
+static const char          *s_tag;
 static rmt_channel_handle_t s_rgb_channel;
 static rmt_encoder_handle_t s_rgb_encoder;
+static SemaphoreHandle_t    s_rgb_lock;
 static bool                 s_rgb_ready;
 
 RMT_ENCODER_FUNC_ATTR
@@ -138,11 +140,16 @@ void status_led_set_rgb(uint8_t red, uint8_t green, uint8_t blue)
 #else
     const uint8_t rgb[] = {green, red, blue};
 #endif
+    if (!s_rgb_lock || xSemaphoreTake(s_rgb_lock, pdMS_TO_TICKS(25)) != pdTRUE)
+    {
+        return;
+    }
     rmt_transmit_config_t transmit = {0};
     if (rmt_transmit(s_rgb_channel, s_rgb_encoder, rgb, sizeof(rgb), &transmit) == ESP_OK)
     {
-        rmt_tx_wait_all_done(s_rgb_channel, pdMS_TO_TICKS(20));
+        (void)rmt_tx_wait_all_done(s_rgb_channel, pdMS_TO_TICKS(20));
     }
+    xSemaphoreGive(s_rgb_lock);
 }
 
 void status_led_show_mode(transparent_mode_t mode, bool has_upstream)
@@ -182,7 +189,7 @@ void status_led_boot_indicator(transparent_mode_t mode, bool has_upstream)
 
 void status_led_init(const char *tag)
 {
-    s_tag = tag;
+    s_tag                           = tag;
     rmt_tx_channel_config_t channel = {
         .gpio_num          = RGB_LED_GPIO,
         .clk_src           = RMT_CLK_SRC_DEFAULT,
@@ -202,6 +209,12 @@ void status_led_init(const char *tag)
     if (err != ESP_OK)
     {
         ESP_LOGW(s_tag, "RGB LED unavailable on GPIO%d: %s", RGB_LED_GPIO, esp_err_to_name(err));
+        return;
+    }
+    s_rgb_lock = xSemaphoreCreateMutex();
+    if (!s_rgb_lock)
+    {
+        ESP_LOGW(s_tag, "RGB LED lock unavailable");
         return;
     }
     s_rgb_ready = true;
