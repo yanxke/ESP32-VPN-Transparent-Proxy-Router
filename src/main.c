@@ -27,6 +27,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/idf_additions.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "portal_page.h"
 #include "router_config.h"
@@ -63,6 +64,13 @@
 #define SINGMUX_CONTROL_BATCH_MAX 8
 #define SINGMUX_TCP_RX_QUEUE_DEPTH 24
 #define SINGMUX_TCP_DATA_MAX 2048
+/* A single forwarded stream may process this much before yielding.  The
+ * shared throttle below
+ * holds all streams that reach the boundary while the
+ * current owner sleeps, so many active
+ * browser connections cannot round-robin
+ * forever and starve both FreeRTOS idle tasks. */
+#define SINGMUX_RELAY_YIELD_BYTES (8 * 1024)
 #define UDP_MANAGER_BATCH_MAX 8
 #define OTA_UPLOAD_BUFFER_SIZE 1024
 #define BANDWIDTH_HISTORY_SECONDS 30
@@ -220,6 +228,7 @@ static bool    s_singmux_vless_response_pending;
  * for the owning relay to dequeue an item before retrying. */
 static bool                 s_singmux_rx_blocked;
 static TaskHandle_t         s_singmux_manager_task;
+static SemaphoreHandle_t    s_singmux_relay_throttle;
 static singmux_tcp_stream_t s_singmux_tcp_streams[SINGMUX_TCP_STREAM_MAX];
 static singmux_stats_t      s_singmux_stats;
 static uint32_t             s_upload_bps;
@@ -1895,6 +1904,30 @@ static bool singmux_tcp_close(int slot, uint32_t stream_id)
     return xTaskNotifyWait(0, UINT32_MAX, &answer, pdMS_TO_TICKS(1000)) == pdTRUE && answer;
 }
 
+/* Do not use taskYIELD() here: another ready priority-5 relay would simply
+ * run next and can
+ * still keep the idle task from feeding its watchdog.  By
+ * retaining this mutex for one tick,
+ * every relay that has exhausted its
+ * bounded batch is blocked together, leaving an actual idle
+ * opportunity. */
+static void singmux_relay_scheduler_pause(void)
+{
+    if (s_singmux_relay_throttle &&
+        xSemaphoreTake(s_singmux_relay_throttle, portMAX_DELAY) == pdTRUE)
+    {
+        s_singmux_stats.scheduler_yields++;
+        vTaskDelay(1);
+        xSemaphoreGive(s_singmux_relay_throttle);
+        return;
+    }
+    /* The TCP listener can accept a connection just before the persistent
+     * manager creates
+     * the throttle.  It must still yield in that small
+     * startup window. */
+    vTaskDelay(1);
+}
+
 static void relay_singmux_tcp_stream(int client, int slot)
 {
     if (slot < 0 || slot >= SINGMUX_TCP_STREAM_MAX)
@@ -1909,7 +1942,8 @@ static void relay_singmux_tcp_stream(int client, int slot)
     {
         return;
     }
-    bool detached = false;
+    bool   detached              = false;
+    size_t forwarded_since_yield = 0;
     for (;;)
     {
         fd_set reads;
@@ -1931,6 +1965,7 @@ static void relay_singmux_tcp_stream(int client, int slot)
             {
                 break;
             }
+            forwarded_since_yield += (size_t)count;
         }
         singmux_tcp_data_t *item = NULL;
         while (xQueueReceive(receive_queue, &item, 0) == pdTRUE)
@@ -1945,15 +1980,27 @@ static void relay_singmux_tcp_stream(int client, int slot)
                 goto done;
             }
             bool ok = socket_send_all(client, item->data, item->length);
+            forwarded_since_yield += item->length;
             free(item);
             if (!ok)
             {
                 goto close_stream;
             }
+            if (forwarded_since_yield >= SINGMUX_RELAY_YIELD_BYTES)
+            {
+                forwarded_since_yield = 0;
+                singmux_relay_scheduler_pause();
+            }
+        }
+        if (forwarded_since_yield >= SINGMUX_RELAY_YIELD_BYTES)
+        {
+            forwarded_since_yield = 0;
+            singmux_relay_scheduler_pause();
         }
         /* A full queue can happen when this AP client cannot accept data
-         * quickly enough.  It must close only this stream, never the shared
-         * session carrying unrelated browser connections. */
+         * quickly enough.
+         * It must close only this stream, never the shared session carrying unrelated browser
+         * connections. */
         if (s_singmux_tcp_streams[slot].peer_closed && uxQueueMessagesWaiting(receive_queue) == 0)
         {
             detached = singmux_tcp_close(slot, stream_id);
@@ -2853,14 +2900,17 @@ static void transparent_udp_manager_task(void *arg)
              * stopped accepting data. */
             smux_receive_burst = 0;
             ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+            /* Keep a busy downstream relay from waking this same-priority
+             * manager
+             * repeatedly without giving either idle task a turn. */
+            singmux_relay_scheduler_pause();
         }
         else if (smux_receive_pending)
         {
             if (++smux_receive_burst >= 4)
             {
                 smux_receive_burst = 0;
-                s_singmux_stats.scheduler_yields++;
-                vTaskDelay(1);
+                singmux_relay_scheduler_pause();
             }
         }
         else
@@ -2883,9 +2933,10 @@ static void transparent_udp_server_task(void *arg)
         ESP_LOGE(TAG, "transparent UDP relay listener failed");
         vTaskDelete(NULL);
     }
-    s_udp_manager_queue     = xQueueCreate(UDP_MANAGER_QUEUE_DEPTH, sizeof(udp_ingress_t));
-    s_singmux_control_queue = xQueueCreate(SINGMUX_CONTROL_QUEUE_DEPTH, sizeof(singmux_control_t));
-    if (!s_udp_manager_queue || !s_singmux_control_queue)
+    s_udp_manager_queue      = xQueueCreate(UDP_MANAGER_QUEUE_DEPTH, sizeof(udp_ingress_t));
+    s_singmux_control_queue  = xQueueCreate(SINGMUX_CONTROL_QUEUE_DEPTH, sizeof(singmux_control_t));
+    s_singmux_relay_throttle = xSemaphoreCreateMutex();
+    if (!s_udp_manager_queue || !s_singmux_control_queue || !s_singmux_relay_throttle)
     {
         ESP_LOGE(TAG, "persistent XUDP/smux manager queue allocation failed");
         vTaskDelete(NULL);
